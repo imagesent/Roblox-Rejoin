@@ -202,7 +202,7 @@ class App(ctk.CTk):
         self.after(1000, self._update_session_stats)
 
         print("Welcome to Roblox Auto-Rejoiner!")
-        print("Configure the monitor below, then start it.")
+        print("Choose a game above, then start monitoring.")
 
     def _create_widgets(self):
         self.grid_columnconfigure(0, weight=1)
