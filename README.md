@@ -11,3 +11,7 @@ A Windows app that monitors Roblox and tries to rejoin your chosen game after a 
 3. In the app, search for a game or enter its Place ID.
 4. Set the rejoin delay and click **Save settings**.
 5. Click **Join + Start Monitor** to join the game and start monitoring, or **Start Monitor** to monitor an already-open Roblox client.
+
+## Support
+
+Having a problem or found a bug? Message me on Discord: [Contact me](https://discord.com/users/244804524043141128)
