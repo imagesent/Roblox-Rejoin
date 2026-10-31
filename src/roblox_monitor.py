@@ -1,4 +1,5 @@
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -43,8 +44,10 @@ REJOIN_RETRY_DELAY = 10.0
 MAX_REJOIN_RETRY_DELAY = 60.0
 ROBLOX_START_TIMEOUT = 90.0
 ROBLOX_STABLE_TIME = 30.0
+DISCONNECT_TRANSITION_GRACE_SECONDS = 10.0
 GAME_NAME = "Not Set"
 GAME_URL = "https://www.roblox.com/games/"
+UNIVERSE_ID: int | None = None
 
 MONITOR_ACTIVE = True
 
@@ -65,10 +68,10 @@ def _valid_place_id(place_id: str) -> bool:
     return bool(place_id and place_id != DEFAULT_PLACE_ID and place_id.isdigit())
 
 
-def get_game_name(place_id: str) -> str:
-    """Return the Roblox experience name, with the place ID as a safe fallback."""
+def get_universe_id(place_id: str) -> int | None:
+    """Resolve a Roblox place to its containing experience."""
     if not _valid_place_id(place_id):
-        return "Not Set"
+        return None
 
     headers = {"User-Agent": "Roblox-Auto-Rejoiner/1.0"}
     try:
@@ -78,7 +81,26 @@ def get_game_name(place_id: str) -> str:
             timeout=5,
         )
         response.raise_for_status()
-        universe_id = response.json().get("universeId")
+        payload = response.json()
+        universe_id = payload.get("universeId") if isinstance(payload, dict) else None
+        if isinstance(universe_id, str) and universe_id.isdigit():
+            universe_id = int(universe_id)
+        if isinstance(universe_id, int) and not isinstance(universe_id, bool):
+            return universe_id if universe_id > 0 else None
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        log(f"Could not fetch the game universe: {exc}")
+
+    return None
+
+
+def get_game_name(place_id: str, universe_id: int | None = None) -> str:
+    """Return the Roblox experience name, with the place ID as a safe fallback."""
+    if not _valid_place_id(place_id):
+        return "Not Set"
+
+    headers = {"User-Agent": "Roblox-Auto-Rejoiner/1.0"}
+    try:
+        universe_id = universe_id or get_universe_id(place_id)
         if universe_id:
             response = requests.get(
                 f"https://games.roblox.com/v1/games?universeIds={universe_id}",
@@ -91,7 +113,6 @@ def get_game_name(place_id: str) -> str:
                 return games[0]["name"]
     except (requests.RequestException, ValueError, TypeError) as exc:
         log(f"Could not fetch the game name: {exc}")
-
     return f"Place {place_id}"
 
 
@@ -234,15 +255,18 @@ _recovery_lock = threading.Lock()
 
 def reload_monitor_config(fetch_game_name: bool = False) -> None:
     """Reload monitor settings without re-importing the module."""
-    global PLACE_ID, REJOIN_DELAY, CHECK_INTERVAL, GAME_NAME, GAME_URL
+    global PLACE_ID, REJOIN_DELAY, CHECK_INTERVAL, GAME_NAME, GAME_URL, UNIVERSE_ID
 
     config = load_config()
     PLACE_ID = str(config.get("PLACE_ID", DEFAULT_PLACE_ID)).strip()
     REJOIN_DELAY = _positive_number(config.get("REJOIN_DELAY"), 5.0)
     CHECK_INTERVAL = _positive_number(config.get("CHECK_INTERVAL"), 3.0, 0.5)
-    GAME_NAME = get_game_name(PLACE_ID) if fetch_game_name else (
-        "Not Set" if not _valid_place_id(PLACE_ID) else f"Place {PLACE_ID}"
-    )
+    if fetch_game_name:
+        UNIVERSE_ID = get_universe_id(PLACE_ID)
+        GAME_NAME = get_game_name(PLACE_ID, UNIVERSE_ID)
+    else:
+        UNIVERSE_ID = None
+        GAME_NAME = "Not Set" if not _valid_place_id(PLACE_ID) else f"Place {PLACE_ID}"
     GAME_URL = f"https://www.roblox.com/games/{PLACE_ID}"
 
     with state_lock:
@@ -266,7 +290,30 @@ class RobloxLogMonitor:
         self.position = 0
         self.pending_line = ""
         self.join_detected = False
+        self.pending_disconnect_reason: str | None = None
+        self.pending_disconnect_at: float | None = None
+        self.last_join_universe_id: int | None = None
+        self.last_join_at: float | None = None
+        self.universe_ids: dict[str, int | None] = {PLACE_ID: UNIVERSE_ID}
         self._select_latest(start_at_end=True)
+
+    def _get_universe_id(self, place_id: str) -> int | None:
+        if place_id not in self.universe_ids:
+            self.universe_ids[place_id] = get_universe_id(place_id)
+        return self.universe_ids[place_id]
+
+    def _take_expired_disconnect(self, now: float) -> str | None:
+        if (
+            self.pending_disconnect_reason is not None
+            and self.pending_disconnect_at is not None
+            and now - self.pending_disconnect_at
+            >= DISCONNECT_TRANSITION_GRACE_SECONDS
+        ):
+            reason = self.pending_disconnect_reason
+            self.pending_disconnect_reason = None
+            self.pending_disconnect_at = None
+            return reason
+        return None
 
     def get_latest_log(self) -> str | None:
         try:
@@ -299,9 +346,10 @@ class RobloxLogMonitor:
         return True
 
     def check_for_disconnect(self) -> str | None:
+        now = time.monotonic()
         latest = self.get_latest_log()
         if not latest:
-            return None
+            return self._take_expired_disconnect(now)
         if latest != self.current_log:
             self.current_log = latest
             self.position = 0
@@ -318,10 +366,10 @@ class RobloxLogMonitor:
                 new_data = log_file.read(512 * 1024)
                 self.position = log_file.tell()
         except OSError:
-            return None
+            return self._take_expired_disconnect(now)
 
         if not new_data:
-            return None
+            return self._take_expired_disconnect(now)
 
         text = self.pending_line + new_data.decode("utf-8", errors="ignore")
         lines = text.splitlines(keepends=True)
@@ -334,10 +382,42 @@ class RobloxLogMonitor:
             lowered = line.lower()
             if "joining game" in lowered and "place " in lowered:
                 self.join_detected = True
+                match = re.search(r"\bplace\s+(\d+)\b", lowered)
+                if match:
+                    self.last_join_universe_id = self._get_universe_id(match.group(1))
+                    self.last_join_at = now
+                    if (
+                        self.pending_disconnect_reason is not None
+                        and UNIVERSE_ID is not None
+                        and self.last_join_universe_id == UNIVERSE_ID
+                    ):
+                        log(
+                            "Ignoring a transient disconnect during a teleport "
+                            "within the configured experience."
+                        )
+                        self.pending_disconnect_reason = None
+                        self.pending_disconnect_at = None
             for marker in DISCONNECT_MARKERS:
                 if marker in lowered:
-                    return marker
-        return None
+                    same_experience_join = (
+                        UNIVERSE_ID is not None
+                        and self.last_join_universe_id == UNIVERSE_ID
+                        and self.last_join_at is not None
+                        and now - self.last_join_at
+                        <= DISCONNECT_TRANSITION_GRACE_SECONDS
+                    )
+                    if same_experience_join:
+                        log(
+                            "Ignoring a transient disconnect during a teleport "
+                            "within the configured experience."
+                        )
+                        self.pending_disconnect_reason = None
+                        self.pending_disconnect_at = None
+                    elif self.pending_disconnect_reason is None:
+                        self.pending_disconnect_reason = marker
+                        self.pending_disconnect_at = now
+
+        return self._take_expired_disconnect(now)
 
     def reset_join_detection(self) -> None:
         self.join_detected = False
