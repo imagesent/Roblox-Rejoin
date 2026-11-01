@@ -4,7 +4,7 @@ A Windows app that monitors Roblox and tries to rejoin your chosen game after a 
 
 ## Run the app
 
-Download **[Roblox Auto-Rejoiner.exe](https://github.com/imagesent/Roblox-Rejoin/releases/latest/download/Roblox%20Auto-Rejoiner.exe)**
+Download **[Roblox Auto-Rejoiner.exe](https://github.com/imagesent/Roblox-Rejoin/releases/latest/download/Roblox.Auto-Rejoiner.exe)**
 from the latest release and run it on Windows. The standalone app does not
 require Python or a separate package installation.
 
