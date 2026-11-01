@@ -2,8 +2,13 @@
 setlocal
 cd /d "%~dp0"
 
-set "APP=%~dp0app\Roblox Auto-Rejoiner.exe"
-if exist "%APP%" goto run
+set "APP=%~dp0app\Roblox Rejoiner.exe"
+if not exist "%APP%" goto build
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$exe=Get-Item -LiteralPath '%APP%'; $inputs=@((Get-ChildItem -LiteralPath '%~dp0src' -Recurse -File),(Get-ChildItem -LiteralPath '%~dp0assets' -Recurse -File),(Get-Item -LiteralPath '%~dp0roblox_rejoiner.spec'),(Get-Item -LiteralPath '%~dp0README.md'),(Get-Item -LiteralPath '%~dp0requirements.txt')); if ($inputs | Where-Object { $_.LastWriteTime -gt $exe.LastWriteTime }) { exit 1 }"
+if not errorlevel 1 goto run
+
+:build
 
 where python >nul 2>nul
 if errorlevel 1 goto python_missing
@@ -19,13 +24,13 @@ echo Installing PyInstaller...
 python -m pip install pyinstaller
 if errorlevel 1 goto failed
 
-echo Building Roblox Auto-Rejoiner...
-python -m PyInstaller --noconfirm --clean --distpath "app" --workpath "build" "main_gui.spec"
+echo Building Roblox Rejoiner...
+python -m PyInstaller --noconfirm --clean --distpath "app" --workpath "build" "roblox_rejoiner.spec"
 if errorlevel 1 goto failed
 if not exist "%APP%" goto build_missing
 
 :run
-echo Launching Roblox Auto-Rejoiner...
+echo Launching Roblox Rejoiner...
 start "" "%APP%"
 exit /b 0
 

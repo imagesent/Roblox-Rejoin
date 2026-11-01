@@ -2,13 +2,12 @@
 
 
 a = Analysis(
-    ['src\\main_gui.py'],
+    ['src\\roblox_rejoiner.py'],
     pathex=['src'],
     binaries=[],
     datas=[
         ('README.md', '.'),
-        ('assets\\app_icon.ico', 'assets'),
-        ('assets\\profile.png', 'assets'),
+        ('assets\\rejoiner_logo.png', '.'),
     ],
     hiddenimports=[],
     hookspath=[],
@@ -26,7 +25,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Roblox Auto-Rejoiner',
+    name='Roblox Rejoiner',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -39,5 +38,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='assets\\app_icon.ico',
+    icon='assets\\rejoiner_logo.ico',
 )

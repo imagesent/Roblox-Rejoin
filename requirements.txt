@@ -2,3 +2,4 @@ requests
 psutil
 customtkinter
 Pillow
+PySide6>=6.6
