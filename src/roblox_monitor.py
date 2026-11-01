@@ -719,8 +719,8 @@ def recover_roblox(
 
 
 def monitor_loop(initial_join: bool = False) -> None:
-    global MONITOR_ACTIVE
-    MONITOR_ACTIVE = True
+    if not MONITOR_ACTIVE:
+        return
     reload_monitor_config(fetch_game_name=True)
     log_monitor = RobloxLogMonitor()
     log("Monitor started. Watching for Roblox events...")
