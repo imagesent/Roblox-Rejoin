@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-set "APP=%~dp0app\Roblox Auto-Rejoiner Studio (Icon).exe"
+set "APP=%~dp0app\Roblox Auto-Rejoiner.exe"
 if exist "%APP%" goto run
 
 where python >nul 2>nul

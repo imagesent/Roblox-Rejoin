@@ -26,7 +26,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Roblox Auto-Rejoiner Studio (Icon)',
+    name='Roblox Auto-Rejoiner',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
