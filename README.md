@@ -4,21 +4,20 @@ A Windows app that monitors Roblox and tries to rejoin your chosen game after a 
 
 ## Run the app
 
-For a ready-to-run Windows app, download `Roblox Auto-Rejoiner.exe` from the
-latest [GitHub Release](https://github.com/imagesent/Roblox-Rejoin/releases)
-and run it. Python and separate package installation are not required.
-
 1. Download or clone this project.
-2. Double-click `Setup and Run.cmd`.
-   - If the packaged app is present, it opens directly.
-   - If it needs to build the app, install Python 3.10 or newer and run the script again.
-3. In the app, search for a game or enter its Place ID.
-4. Set the rejoin delay and click **Save settings**.
-5. Click **Join + Start Monitor** to join the game and start monitoring, or **Start Monitor** to monitor an already-open Roblox client.
+2. Install Python 3.10 or newer if it is not already installed.
+3. Double-click `Setup and Run.cmd`. On first run, it installs the requirements,
+   builds the Windows app, and launches it. Later runs open the built app directly.
+4. In the app, search for a game or enter its Place ID.
+5. Set the rejoin delay and click **Save settings**.
+6. Click **Join + Start Monitor** to join the game and start monitoring, or **Start Monitor** to monitor an already-open Roblox client.
 
 The monitor resolves the selected Place ID to its experience (Universe ID), so
 teleports between places in that same experience are not mistaken for a
 disconnect.
+
+Failed joins are retried until the monitor is stopped or a join succeeds. The
+retry delay increases up to 60 seconds between attempts.
 
 ## Support
 

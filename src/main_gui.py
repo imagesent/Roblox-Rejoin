@@ -19,13 +19,14 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 THEME_ROTATION_INTERVAL_MS = 6000
-THEME_TRANSITION_DURATION_MS = 420
-THEME_TRANSITION_FRAME_MS = 20
+THEME_TRANSITION_DURATION_MS = 240
+THEME_TRANSITION_FRAME_MS = 30
 AUTO_THEME_NAME = "Chrome"
 THEMES = {
     "Blue": {
         "background": "#0b1220",
         "surface": "#172338",
+        "border": "#293a53",
         "input": "#101a2b",
         "console": "#0b1220",
         "accent": "#3b82f6",
@@ -38,6 +39,7 @@ THEMES = {
     "Purple": {
         "background": "#130d20",
         "surface": "#211632",
+        "border": "#3a2a50",
         "input": "#171025",
         "console": "#130d20",
         "accent": "#a78bfa",
@@ -50,6 +52,7 @@ THEMES = {
     "Emerald": {
         "background": "#071a15",
         "surface": "#10291f",
+        "border": "#214737",
         "input": "#0b211a",
         "console": "#071a15",
         "accent": "#34d399",
@@ -62,6 +65,7 @@ THEMES = {
     "Sunset": {
         "background": "#1d100d",
         "surface": "#321b12",
+        "border": "#573322",
         "input": "#28150f",
         "console": "#1d100d",
         "accent": "#fb923c",
@@ -74,6 +78,7 @@ THEMES = {
     "Ocean": {
         "background": "#071720",
         "surface": "#102733",
+        "border": "#254453",
         "input": "#0b1d27",
         "console": "#071720",
         "accent": "#38bdf8",
@@ -86,6 +91,7 @@ THEMES = {
     "Rose": {
         "background": "#1d1018",
         "surface": "#301a27",
+        "border": "#4b2b3d",
         "input": "#25131e",
         "console": "#1d1018",
         "accent": "#f472b6",
@@ -98,6 +104,7 @@ THEMES = {
     "Lavender": {
         "background": "#151326",
         "surface": "#24213a",
+        "border": "#3c3858",
         "input": "#1b1930",
         "console": "#151326",
         "accent": "#c4b5fd",
@@ -110,6 +117,7 @@ THEMES = {
     "Graphite": {
         "background": "#111315",
         "surface": "#202326",
+        "border": "#373c40",
         "input": "#191c1f",
         "console": "#111315",
         "accent": "#a3e635",
@@ -149,8 +157,9 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Roblox Auto-Rejoiner")
-        self.geometry("920x760")
-        self.resizable(False, False)
+        self.geometry("980x800")
+        self.minsize(860, 720)
+        self.resizable(True, True)
         self.iconbitmap(_asset_path("app_icon.ico"))
         self.protocol("WM_DELETE_WINDOW", self.close_app)
 
@@ -163,7 +172,10 @@ class App(ctk.CTk):
         self._original_stdout = sys.stdout
         self._console_queue = queue.SimpleQueue()
         self._game_search_queue = queue.SimpleQueue()
+        self._place_preview_queue = queue.SimpleQueue()
         self._game_search_generation = 0
+        self._place_preview_generation = 0
+        self._place_preview_after = None
         self._game_search_results = {}
         self._game_search_window = None
         self._game_search_popup_labels = []
@@ -194,9 +206,11 @@ class App(ctk.CTk):
         self._active_theme = initial_theme
 
         self._create_widgets()
+        self.var_place_id.trace_add("write", self._on_place_id_changed)
         self._apply_theme(initial_theme)
         self._apply_theme_selector(initial_theme)
         self._schedule_theme_rotation()
+        self._on_place_id_changed()
         sys.stdout = RedirectStdout(self._console_queue)
         self.after(50, self._drain_console)
         self.after(1000, self._update_session_stats)
@@ -301,7 +315,7 @@ class App(ctk.CTk):
                 textvariable=variable,
                 height=34,
                 corner_radius=10,
-                border_width=0,
+                border_width=1,
             )
             entry.grid(
                 row=3, column=column, padx=(22, 10), pady=(0, 8), sticky="ew"
@@ -348,7 +362,7 @@ class App(ctk.CTk):
             placeholder_text="Search Roblox games by name",
             height=34,
             corner_radius=10,
-            border_width=0,
+            border_width=1,
         )
         self.game_search_entry.grid(
             row=4, column=0, columnspan=2, padx=(22, 10), pady=(0, 4), sticky="ew"
@@ -368,7 +382,7 @@ class App(ctk.CTk):
         self.game_search_preview_frame = ctk.CTkFrame(
             self.config_frame,
             corner_radius=10,
-            height=48,
+            height=76,
         )
         self.game_search_preview_frame.grid(
             row=5, column=0, columnspan=3, padx=22, pady=(0, 4), sticky="ew"
@@ -377,31 +391,31 @@ class App(ctk.CTk):
         self.game_search_icon_label = ctk.CTkLabel(
             self.game_search_preview_frame,
             text="RBX",
-            width=38,
-            height=38,
-            corner_radius=8,
+            width=56,
+            height=56,
+            corner_radius=12,
             font=ctk.CTkFont(size=10, weight="bold"),
         )
         self.game_search_icon_label.grid(
-            row=0, column=0, rowspan=2, padx=(8, 10), pady=5, sticky="w"
+            row=0, column=0, rowspan=2, padx=(10, 12), pady=9, sticky="w"
         )
         self.game_search_title_label = ctk.CTkLabel(
             self.game_search_preview_frame,
-            text="Search and select a game",
+            text="Enter a Place ID to preview its game",
             anchor="w",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=ctk.CTkFont(size=14, weight="bold"),
         )
         self.game_search_title_label.grid(
-            row=0, column=1, padx=(0, 12), pady=(5, 0), sticky="ew"
+            row=0, column=1, padx=(0, 12), pady=(12, 1), sticky="ew"
         )
         self.game_search_detail_label = ctk.CTkLabel(
             self.game_search_preview_frame,
-            text="The game icon and details will appear here.",
+            text="The game name and icon load automatically.",
             anchor="w",
             font=ctk.CTkFont(size=11),
         )
         self.game_search_detail_label.grid(
-            row=1, column=1, padx=(0, 12), pady=(0, 5), sticky="ew"
+            row=1, column=1, padx=(0, 12), pady=(1, 12), sticky="ew"
         )
         self._theme_labels.extend(
             (self.game_search_title_label, self.game_search_detail_label)
@@ -521,7 +535,11 @@ class App(ctk.CTk):
         self._active_theme = dict(theme)
         self.configure(fg_color=theme["background"])
         for frame in self._theme_frames:
-            frame.configure(fg_color=theme["surface"])
+            frame.configure(
+                fg_color=theme["surface"],
+                border_width=1,
+                border_color=theme["border"],
+            )
         for label in self._theme_labels:
             label.configure(text_color=theme["text"])
         self.lbl_mon_status.configure(
@@ -537,6 +555,7 @@ class App(ctk.CTk):
                 fg_color=theme["input"],
                 text_color=theme["text"],
                 placeholder_text_color=theme["muted"],
+                border_color=theme["border"],
             )
         self.console.configure(
             fg_color=theme["console"],
@@ -706,16 +725,106 @@ class App(ctk.CTk):
                 break
             if generation == self._game_search_generation:
                 self._show_game_search_results(results, error)
+        while True:
+            try:
+                generation, place_id, image_data, title, detail = (
+                    self._place_preview_queue.get_nowait()
+                )
+            except queue.Empty:
+                break
+            if (
+                generation == self._place_preview_generation
+                and place_id == self.var_place_id.get().strip()
+            ):
+                self._set_game_search_preview(image_data, title, detail)
         self.after(50, self._drain_console)
 
+    def _on_place_id_changed(self, *_):
+        if self._place_preview_after is not None:
+            self.after_cancel(self._place_preview_after)
+            self._place_preview_after = None
+        self._place_preview_generation += 1
+        generation = self._place_preview_generation
+        place_id = self.var_place_id.get().strip()
+
+        if not place_id:
+            self._set_game_search_preview(
+                None,
+                "Enter a Place ID to preview its game",
+                "The game name and icon load automatically.",
+            )
+            return
+        if not place_id.isdigit():
+            self._set_game_search_preview(
+                None,
+                "Enter a valid Place ID",
+                "Place IDs contain digits only.",
+            )
+            return
+
+        self._set_game_search_preview(
+            None,
+            "Looking up your game...",
+            f"Place ID: {place_id}",
+        )
+        self._place_preview_after = self.after(
+            450,
+            lambda: self._start_place_preview_lookup(place_id, generation),
+        )
+
+    def _start_place_preview_lookup(self, place_id, generation):
+        self._place_preview_after = None
+        if self._closing or generation != self._place_preview_generation:
+            return
+        threading.Thread(
+            target=self._place_preview_worker,
+            args=(place_id, generation),
+            daemon=True,
+        ).start()
+
+    def _place_preview_worker(self, place_id, generation):
+        universe_id = roblox_monitor.get_universe_id(place_id)
+        if universe_id is None:
+            self._place_preview_queue.put(
+                (
+                    generation,
+                    place_id,
+                    None,
+                    "Experience unavailable",
+                    f"Could not resolve Place ID {place_id}.",
+                )
+            )
+            return
+
+        title = roblox_monitor.get_game_name(place_id, universe_id)
+        icon_url = roblox_monitor.get_game_icon_url(universe_id)
+        image_data = None
+        if icon_url:
+            try:
+                image_data = self._download_game_icon(icon_url)
+            except (roblox_monitor.requests.RequestException, ValueError) as exc:
+                roblox_monitor.log(f"Could not download the game icon: {exc}")
+
+        detail = f"Place ID: {place_id}"
+        if image_data is None:
+            detail += "  ·  Icon unavailable"
+        self._place_preview_queue.put(
+            (generation, place_id, image_data, title, detail)
+        )
+
     def _start_game_search(self):
+        query = self.var_game_search.get().strip()
+        if not query:
+            messagebox.showinfo(
+                "Search games",
+                "Please enter a game name in the search box.",
+            )
+            self.game_search_entry.focus_set()
+            return
+
         self._game_search_generation += 1
         generation = self._game_search_generation
         self._close_game_search_window()
-        query = self.var_game_search.get().strip()
-        if not query:
-            self._show_game_search_results([], "Enter a game name to search.")
-            return
 
         self.btn_search_games.configure(state="disabled", text="Searching...")
         self._set_game_search_preview(
@@ -874,6 +983,10 @@ class App(ctk.CTk):
 
     def _select_game_search_result(self, game):
         self.var_place_id.set(game["place_id"])
+        if self._place_preview_after is not None:
+            self.after_cancel(self._place_preview_after)
+            self._place_preview_after = None
+        self._place_preview_generation += 1
         self._set_game_search_preview(
             game.get("icon_data"),
             game["name"],
@@ -885,10 +998,10 @@ class App(ctk.CTk):
     def _set_game_search_preview(self, image_data, title, detail):
         self._game_search_preview_image = self._make_game_icon(
             image_data,
-            (44, 44),
+            (56, 56),
         )
         if self._game_search_preview_image is None:
-            self.game_search_icon_label.configure(image=None, text="RBX")
+            self.game_search_icon_label.configure(image="", text="RBX")
         else:
             self.game_search_icon_label.configure(
                 image=self._game_search_preview_image,
@@ -1054,6 +1167,8 @@ class App(ctk.CTk):
             self.after_cancel(self._theme_rotation_after)
         if self._theme_transition_after is not None:
             self.after_cancel(self._theme_transition_after)
+        if self._place_preview_after is not None:
+            self.after_cancel(self._place_preview_after)
         roblox_monitor.MONITOR_ACTIVE = False
         sys.stdout = self._original_stdout
         self.destroy()

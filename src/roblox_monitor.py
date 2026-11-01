@@ -19,6 +19,7 @@ INTERNET_ENDPOINTS = (
     ("apis.roblox.com", 443),
 )
 DISCONNECT_MARKERS = (
+    "failed to connect to the experience",
     "connection lost",
     "lost connection",
     "error code 277",
@@ -39,7 +40,6 @@ DISCONNECT_MARKERS = (
 PLACE_ID = DEFAULT_PLACE_ID
 REJOIN_DELAY = 5.0
 CHECK_INTERVAL = 3.0
-MAX_REJOIN_ATTEMPTS = 5
 REJOIN_RETRY_DELAY = 10.0
 MAX_REJOIN_RETRY_DELAY = 60.0
 ROBLOX_START_TIMEOUT = 90.0
@@ -114,6 +114,43 @@ def get_game_name(place_id: str, universe_id: int | None = None) -> str:
     except (requests.RequestException, ValueError, TypeError) as exc:
         log(f"Could not fetch the game name: {exc}")
     return f"Place {place_id}"
+
+
+def get_game_icon_url(universe_id: int) -> str | None:
+    """Return a Roblox experience's icon URL."""
+    if not isinstance(universe_id, int) or isinstance(universe_id, bool):
+        return None
+    if universe_id <= 0:
+        return None
+
+    try:
+        response = requests.get(
+            "https://thumbnails.roblox.com/v1/games/icons",
+            params={
+                "universeIds": str(universe_id),
+                "size": "150x150",
+                "format": "Png",
+                "isCircular": "false",
+            },
+            headers={"User-Agent": "Roblox-Auto-Rejoiner/1.0"},
+            timeout=5,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        thumbnails = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(thumbnails, list):
+            raise ValueError("Roblox returned an unexpected game-icon response.")
+        for thumbnail in thumbnails:
+            if (
+                isinstance(thumbnail, dict)
+                and thumbnail.get("targetId") == universe_id
+                and isinstance(thumbnail.get("imageUrl"), str)
+            ):
+                return thumbnail["imageUrl"]
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        log(f"Could not fetch the game icon: {exc}")
+
+    return None
 
 
 def search_games(query: str, limit: int = 20) -> list[dict[str, object]]:
@@ -315,6 +352,28 @@ class RobloxLogMonitor:
             return reason
         return None
 
+    def _record_disconnect_marker(self, line: str, now: float) -> None:
+        for marker in DISCONNECT_MARKERS:
+            if marker not in line:
+                continue
+            same_experience_join = (
+                UNIVERSE_ID is not None
+                and self.last_join_universe_id == UNIVERSE_ID
+                and self.last_join_at is not None
+                and now - self.last_join_at
+                <= DISCONNECT_TRANSITION_GRACE_SECONDS
+            )
+            if same_experience_join:
+                log(
+                    "Ignoring a transient disconnect during a teleport "
+                    "within the configured experience."
+                )
+                self.pending_disconnect_reason = None
+                self.pending_disconnect_at = None
+            elif self.pending_disconnect_reason is None:
+                self.pending_disconnect_reason = marker
+                self.pending_disconnect_at = now
+
     def get_latest_log(self) -> str | None:
         try:
             entries = [
@@ -397,25 +456,10 @@ class RobloxLogMonitor:
                         )
                         self.pending_disconnect_reason = None
                         self.pending_disconnect_at = None
-            for marker in DISCONNECT_MARKERS:
-                if marker in lowered:
-                    same_experience_join = (
-                        UNIVERSE_ID is not None
-                        and self.last_join_universe_id == UNIVERSE_ID
-                        and self.last_join_at is not None
-                        and now - self.last_join_at
-                        <= DISCONNECT_TRANSITION_GRACE_SECONDS
-                    )
-                    if same_experience_join:
-                        log(
-                            "Ignoring a transient disconnect during a teleport "
-                            "within the configured experience."
-                        )
-                        self.pending_disconnect_reason = None
-                        self.pending_disconnect_at = None
-                    elif self.pending_disconnect_reason is None:
-                        self.pending_disconnect_reason = marker
-                        self.pending_disconnect_at = now
+            self._record_disconnect_marker(lowered, now)
+
+        if self.pending_line:
+            self._record_disconnect_marker(self.pending_line.lower(), now)
 
         return self._take_expired_disconnect(now)
 
@@ -587,7 +631,7 @@ def recover_roblox(
     log_monitor: RobloxLogMonitor | None = None,
     initial_join: bool = False,
 ) -> bool:
-    """Retry a failed join a bounded number of times, then stop cleanly."""
+    """Keep retrying failed joins until one succeeds or monitoring stops."""
     if not _recovery_lock.acquire(blocking=False):
         return is_roblox_running()
     try:
@@ -600,9 +644,8 @@ def recover_roblox(
             if not _controlled_delay(REJOIN_DELAY, pause_aware=pause_aware):
                 return False
 
-        for attempt in range(1, MAX_REJOIN_ATTEMPTS + 1):
-            if not MONITOR_ACTIVE:
-                return False
+        attempt = 1
+        while MONITOR_ACTIVE:
             if not _valid_place_id(PLACE_ID):
                 with state_lock:
                     state["status_message"] = "Invalid or missing Place ID"
@@ -615,7 +658,7 @@ def recover_roblox(
                 log_monitor.reset_join_detection()
             with state_lock:
                 state["status_message"] = (
-                    f"Launching Roblox (attempt {attempt}/{MAX_REJOIN_ATTEMPTS})..."
+                    f"Launching Roblox (attempt {attempt})..."
                 )
             launch_requested = launch_roblox()
             if launch_requested and _wait_for_roblox(
@@ -654,32 +697,22 @@ def recover_roblox(
                 )
             else:
                 failure_reason = "Roblox closed or disconnected before startup completed"
-            if attempt == MAX_REJOIN_ATTEMPTS:
-                break
             retry_delay = min(
-                REJOIN_RETRY_DELAY * (2 ** (attempt - 1)),
+                REJOIN_RETRY_DELAY * (2 ** min(attempt - 1, 10)),
                 MAX_REJOIN_RETRY_DELAY,
             )
             with state_lock:
                 state["status_message"] = (
                     f"{failure_reason}; retrying in {retry_delay:g}s "
-                    f"({attempt}/{MAX_REJOIN_ATTEMPTS})..."
+                    f"(attempt {attempt})..."
                 )
             log(
                 f"{failure_reason}. Retrying in {retry_delay:g} seconds "
-                f"({attempt}/{MAX_REJOIN_ATTEMPTS})..."
+                f"(attempt {attempt})..."
             )
             if not _controlled_delay(retry_delay, pause_aware=pause_aware):
                 return False
-        with state_lock:
-            state["status_message"] = (
-                f"Rejoin stopped after {MAX_REJOIN_ATTEMPTS} failed attempts. "
-                f"Last result: {failure_reason}."
-            )
-        log(
-            f"Rejoin stopped after {MAX_REJOIN_ATTEMPTS} failed attempts. "
-            f"Last result: {failure_reason}."
-        )
+            attempt += 1
         return False
     finally:
         _recovery_lock.release()
