@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+app/*.exe
+app/config.json
+config.json
+config.json.tmp
