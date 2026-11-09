@@ -228,13 +228,43 @@ def _child_texts(hwnd) -> list[str]:
     return texts
 
 
+def _window_pid(hwnd) -> int:
+    try:
+        owner = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        return int(owner.value)
+    except Exception:
+        return 0
+
+
+def _owner_window_pid(hwnd) -> int:
+    """pid of the window that owns `hwnd` (GW_OWNER), or 0.
+
+    Roblox does not always show a join/kick dialog from the game process: the
+    dialog can belong to a helper process while the client's own window owns
+    that window, so the owner chain is followed to find the client."""
+    try:
+        current = hwnd
+        for _ in range(4):
+            owner = user32.GetWindow(current, 4)      # GW_OWNER
+            if not owner:
+                return 0
+            pid = _window_pid(owner)
+            if pid:
+                return pid
+            current = owner
+    except Exception:
+        pass
+    return 0
+
+
 def find_kick_dialog(pid: int) -> str | None:
     """If `pid` shows a Roblox kick/disconnect/error dialog, return a short
     human reason (including the Error Code when present), else None."""
     return scan_client_states({pid}).get(pid, {}).get("dialog")
 
 
-def scan_client_states(pids: set[int]) -> dict[int, dict]:
+def scan_client_states(pids: set[int], with_orphans: bool = False):
     """One window-enumeration pass for every tracked client process.
 
     Returns {pid: {"dialog": reason_or_None, "dialog_code": int_or_None,
@@ -244,10 +274,15 @@ def scan_client_states(pids: set[int]) -> dict[int, dict]:
       wording — classified through roblox_error_codes.
     - "dialog_code": the extracted Error Code number, for category handling.
     - "hung": the client's main window is not responding (IsHungAppWindow).
+
+    With `with_orphans`, returns (states, orphans): matching dialogs that
+    belong to no tracked pid, which a caller with exactly one client still
+    waiting to connect can adopt.
     """
     states: dict[int, dict] = {}
+    orphans: list[dict] = []
     if user32 is None or not pids:
-        return states
+        return (states, orphans) if with_orphans else states
     for pid in pids:
         states[pid] = {"dialog": None, "dialog_code": None, "hung": False}
     proto = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
@@ -267,10 +302,22 @@ def scan_client_states(pids: set[int]) -> dict[int, dict]:
                 blob = " | ".join(t for t in texts if t)
                 if blob and _KICK_TEXT_RE.search(blob):
                     reason, code = reason_from_dialog(blob)
-                    cur = states[pid]["dialog"]
+                    target = pid
+                    if target not in pids:
+                        # Shown by a helper process: the owner window names
+                        # the client it belongs to.
+                        owner = _owner_window_pid(h)
+                        if owner in pids:
+                            target = owner
+                        else:
+                            orphans.append({"pid": pid, "owner_pid": owner,
+                                            "title": _window_text(h),
+                                            "reason": reason, "code": code})
+                            return True
+                    cur = states[target]["dialog"]
                     if cur is None or len(reason) > len(cur):
-                        states[pid]["dialog"] = reason
-                        states[pid]["dialog_code"] = code
+                        states[target]["dialog"] = reason
+                        states[target]["dialog_code"] = code
                 return True
             # Track the largest normal window as the client's main window.
             r = wintypes.RECT()
@@ -287,7 +334,7 @@ def scan_client_states(pids: set[int]) -> dict[int, dict]:
     try:
         user32.EnumWindows(proto(_cb), 0)
     except Exception:
-        return states
+        return (states, orphans) if with_orphans else states
     for pid, s in states.items():
         hwnd = s.pop("_main_hwnd", None)
         s.pop("_main_area", None)
@@ -296,6 +343,8 @@ def scan_client_states(pids: set[int]) -> dict[int, dict]:
                 s["hung"] = bool(user32.IsHungAppWindow(hwnd))
             except Exception:
                 s["hung"] = False
+    if with_orphans:
+        return states, orphans
     return states
 
 

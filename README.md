@@ -106,6 +106,14 @@ account, place, server and reason spelled out, and multi-account summaries
 list each account on its own spaced block. Only usernames and events are
 sent, never cookies.
 
+**Rejoin together** (Rejoiner Setup → Behavior) keeps a group in one server:
+when any account is removed from the game — crash, kick, disconnect — every
+other running account leaves and rejoins too, so nobody is left behind in a
+different server. Each account keeps its own rejoin delay and target, and the
+Kill button still moves only the account you clicked. It can be switched on or
+off at any time, including while monitoring runs, and the Discord bot can
+toggle it with a `rejoin_all` command.
+
 Errors are classified by Roblox's error codes: moderation kicks and
 disconnects rejoin immediately, temporarily-unavailable games (updating,
 shut down, full) back off two minutes, session-overlap codes wait for
@@ -121,6 +129,13 @@ the Setup page while monitoring is active).
 The monitor resolves a selected Place ID to its experience (Universe ID), so
 teleports between places in that same experience are not mistaken for a
 disconnect.
+
+Roblox's own join failures ("A Http error has occurred", Error Codes 500–530)
+are recognised as retryable: the client is closed and the account rejoins
+rather than sitting on the dialog. Dialogs shown by a Roblox helper process
+instead of the game itself are still matched — the owner window is followed to
+find the client, and with a single client still connecting the dialog is
+adopted by it.
 
 Failed joins are retried until the monitor is stopped or a join succeeds. The
 retry delay increases up to 60 seconds between attempts.

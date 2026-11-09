@@ -578,6 +578,7 @@ class MonitorEngine(QThread):
                 "next_join_try": 0.0,
                 "server_check_done": False,
                 "server_verified": False,
+                "following": False,
                 "staged_reason": None}
 
     @staticmethod
@@ -597,6 +598,7 @@ class MonitorEngine(QThread):
         st["wrong_server_since"] = None
         st["server_check_done"] = False
         st["server_verified"] = False
+        st["following"] = False
         st["server"] = None
         st["dialog_reported"] = False
         st["hung_reported"] = False
@@ -689,6 +691,9 @@ class MonitorEngine(QThread):
         st["hung_reported"] = False
         self._set_reason(st, reason)
         self._begin_leave(st, now, delay=delay, reason=reason)
+        # Everyone else follows, so a group stays in the same server.
+        self._rejoin_company(getattr(self, "_rt", None)
+                             or self._rt_counts_cache, st, now)
 
     def _check_collisions(self, rt: dict, now: float) -> None:
         """Different-servers mode: Roblox can silently matchmake two accounts
@@ -780,6 +785,7 @@ class MonitorEngine(QThread):
         launcher.start()
 
         rt: dict[int, dict] = {}
+        self._rt = rt            # live table, for rejoin-together
             # Resolve every account's join link first, one link at a time, so a
         # transient API failure never decides an account's destination.
         now0 = time.time()
@@ -972,11 +978,13 @@ class MonitorEngine(QThread):
 
             kick_detect = bool(self.flags.get("kick_detect")) and relaunch
 
-                # One window-enumeration pass per tick covers kick dialogs and
+            # One window-enumeration pass per tick covers kick dialogs and
             # frozen windows for every running client at once.
             running_pids = {s["pid"] for s in rt.values()
                             if s["state"] == "running" and s.get("pid")}
-            win_states = scan_client_states(running_pids) if running_pids else {}
+            win_states, orphan_dialogs = (scan_client_states(running_pids, True)
+                                          if running_pids else ({}, []))
+            self._adopt_orphan_dialogs(rt, win_states, orphan_dialogs)
 
             for uid, st in rt.items():
                 if self.stop_event.is_set():
@@ -1045,6 +1053,71 @@ class MonitorEngine(QThread):
             self._mutex_handles = []
         except Exception:
             pass
+
+    def _adopt_orphan_dialogs(self, rt: dict, win_states: dict,
+                              orphans: list) -> None:
+        """Give an unattributed error dialog to the client it must belong to.
+
+        Roblox sometimes shows "Join Error", "Disconnected" and similar
+        dialogs from a helper process, so the dialog is not owned by the
+        client's pid and no account would otherwise notice it. When exactly
+        one client is still waiting to connect, the dialog is clearly its."""
+        if not orphans:
+            return
+        waiting = [(uid, st) for uid, st in rt.items()
+                   if st["state"] == "running" and st.get("pid")
+                   and not st.get("was_ingame")
+                   and not win_states.get(st["pid"], {}).get("dialog")]
+        if len(waiting) != 1:
+            for orphan in orphans:
+                self.log.emit(
+                    f"Found a Roblox error dialog "
+                    f"({orphan.get('title') or 'dialog'}: "
+                    f"{orphan.get('reason')}) that doesn't belong to a "
+                    f"tracked client.")
+            return
+        _uid, st = waiting[0]
+        orphan = orphans[0]
+        slot = win_states.setdefault(st["pid"],
+                                     {"dialog": None, "dialog_code": None,
+                                      "hung": False})
+        slot["dialog"] = orphan.get("reason")
+        slot["dialog_code"] = orphan.get("code")
+        self.log.emit(f"Error dialog found for "
+                      f"{st['acc'].get('username', '?')} "
+                      f"({orphan.get('reason')}).")
+
+    def _rejoin_company(self, rt: dict, trigger_st: dict, now: float) -> int:
+        """Send every other running account back to the same server too.
+
+        "Rejoin together" keeps a group in one server: when any account is
+        removed from the game, the rest follow it out and rejoin, so nobody is
+        left behind in a different server. Only accounts that are actually in
+        the game are touched, and each keeps its own delay and target."""
+        if not self.flags.get("rejoin_all"):
+            return 0
+        trigger = trigger_st["acc"].get("username", "?")
+        moved = 0
+        for uid, st in rt.items():
+            if st is trigger_st:
+                continue
+            if st["state"] != "running" or st.get("intentional"):
+                continue
+            if st.get("following"):
+                continue
+            st["following"] = True
+            reason = f"rejoining together with {trigger}"
+            self._remove_from_game(st, now, reason, count_disconnect=False,
+                                   delay=2)
+            self.log.emit(f"Together: {st['acc']['username']} is rejoining with "
+                          f"{trigger}.")
+            self._notify("info", st["acc"].get("username", "?"),
+                         event="Rejoining with the group",
+                         details=self._account_details(st) + [
+                             ("Reason", f"{trigger} left the game")],
+                         footer="Rejoin together")
+            moved += 1
+        return moved
 
     def _handle_launch_failure(self, st: dict, err, now: float,
                                relaunch: bool) -> bool:

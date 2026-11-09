@@ -55,6 +55,7 @@ def publish_state(win) -> None:
         "diff_server": bool(win.flags.get("diff_server")),
         "join_server_url": str(win.cfg.get("joinserver_url", "") or ""),
         "auto_relaunch": bool(win.flags.get("auto_relaunch", True)),
+        "rejoin_all": bool(win.flags.get("rejoin_all")),
         "global_rejoin_delay": str(win.cfg.get("delay", "60") or "60"),
         "default_place": str(win.cfg.get("place", "") or ""),
         "accounts": accounts,
@@ -99,7 +100,8 @@ def apply_command(win, cmd) -> tuple[bool, str]:
     value = cmd.get("value")
 
     flag_actions = {"kick_detect": "kick_detect", "diff_server": "diff_server",
-                    "detect_open": "detect_open", "auto_relaunch": "auto_relaunch"}
+                    "detect_open": "detect_open", "auto_relaunch": "auto_relaunch",
+                    "rejoin_all": "rejoin_all", "rejoin_together": "rejoin_all"}
     if action in flag_actions:
         flag = flag_actions[action]
         want = _truthy(value)

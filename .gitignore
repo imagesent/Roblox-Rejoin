@@ -2,7 +2,11 @@ __pycache__/
 *.py[cod]
 .venv/
 build/
-app/*.exe
+# The built app lives here, including the backup an update leaves behind
+# (Roblox Rejoiner.exe.old<pid>) and any partial download.
+app/
+*.exe.old*
+*.exe.update
 app/config.json
 config.json
 config.json.tmp

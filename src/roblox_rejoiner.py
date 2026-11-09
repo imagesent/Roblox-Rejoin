@@ -978,12 +978,16 @@ class SetupPage(QWidget):
         self.sw_kick = self._switch("kickdetect_on")
         self.sw_diff = self._switch("diffserver_on")
         self.sw_detect = self._switch("detect_open")
+        self.sw_together = self._switch("rejoinall_on")
         body.addWidget(_section("Behavior"))
         body.addWidget(_card_of([
             _row("Auto relaunch", "Relaunch accounts after crashes/kicks — turn off "
                  "to just launch them once", self.sw_relaunch),
             _row("Kick detection", "Rejoin when a client is kicked but still open",
                  self.sw_kick),
+            _row("Rejoin together", "When one account is removed from the game, "
+                 "rejoin every other account too, so the group stays in the same "
+                 "server", self.sw_together),
             _row("Different servers", "Put each account in its own server "
                  "(auto-splits collisions)", self.sw_diff),
             _row("Detect open clients", "Adopt already-open Roblox clients on "
@@ -1217,7 +1221,8 @@ class SetupPage(QWidget):
     def _switch(self, cfg_key: str, default: bool = False) -> IOSSwitch:
         flag = {"kickdetect_on": "kick_detect", "diffserver_on": "diff_server",
                 "detect_open": "detect_open", "auto_relaunch": "auto_relaunch",
-                "joinserver_on": "join_server"}[cfg_key]
+                "joinserver_on": "join_server",
+                "rejoinall_on": "rejoin_all"}[cfg_key]
         sw = IOSSwitch(bool(self.win.cfg.get(cfg_key, default)))
         sw.toggled.connect(lambda v, k=cfg_key, f=flag: self.win.set_flag(k, f, v))
         return sw
@@ -1960,6 +1965,7 @@ class MainWindow(QWidget):
             "detect_open": bool(self.cfg.get("detect_open", False)),
             "auto_relaunch": bool(self.cfg.get("auto_relaunch", True)),
             "join_server": bool(self.cfg.get("joinserver_on", False)),
+            "rejoin_all": bool(self.cfg.get("rejoinall_on", False)),
         }
         self.engine: MonitorEngine | None = None
         self._session_start = None
@@ -2063,10 +2069,10 @@ class MainWindow(QWidget):
         # for the app to be idle (or the user clicks "Restart & update").
         target = updater.exe_path()
         if target:
-            try:
-                updater.cleanup_stale(target)
-            except Exception:
-                pass
+            # The previous update's backup is still locked while that process
+            # exits, so keep trying for a while instead of leaving a 60 MB
+            # file behind until the app is next started.
+            self._clean_update_leftovers(target)
             QTimer.singleShot(10000, lambda: self.check_updates(manual=False))
             self._update_timer = QTimer(self)
             self._update_timer.setInterval(UPDATE_CHECK_SECS * 1000)
@@ -2654,6 +2660,25 @@ class MainWindow(QWidget):
         else:
             QTimer.singleShot(3000, self.restart_for_update)
 
+    def _clean_update_leftovers(self, target: str, attempt: int = 0):
+        """Remove .old/.update leftovers, retrying while they stay locked."""
+        try:
+            if updater.cleanup_stale(target):
+                return
+        except Exception:
+            return
+        if attempt >= 6:                 # ~2 minutes of trying
+            try:
+                self.monitor_page.on_log(
+                    "An old app backup could not be removed yet; it will be "
+                    "cleaned on the next start.")
+            except (AttributeError, RuntimeError):
+                pass
+            return
+        QTimer.singleShot(
+            4000 + attempt * 4000,
+            lambda: self._clean_update_leftovers(target, attempt + 1))
+
     def restart_for_update(self):
         """Launch the freshly swapped exe and exit this instance."""
         target = updater.exe_path()
@@ -2684,7 +2709,8 @@ class MainWindow(QWidget):
              "diff_server": ("diffserver_on", self.setup_page, "sw_diff"),
              "detect_open": ("detect_open", self.setup_page, "sw_detect"),
              "auto_relaunch": ("auto_relaunch", self.setup_page, "sw_relaunch"),
-             "join_server": ("joinserver_on", self.setup_page, "sw_join")}
+             "join_server": ("joinserver_on", self.setup_page, "sw_join"),
+             "rejoin_all": ("rejoinall_on", self.setup_page, "sw_together")}
         if flag not in m:
             return False
         cfg_key, pageobj, sw_attr = m[flag]
@@ -2825,6 +2851,14 @@ class MainWindow(QWidget):
         self.stack.setCurrent(index)
 
     def closeEvent(self, ev):
+        # A previous run's backup is never locked by *this* process, so this
+        # is the most reliable moment to remove it.
+        try:
+            leftover = updater.exe_path()
+            if leftover:
+                updater.cleanup_stale(leftover)
+        except Exception:
+            pass
         try:
             self._bridge_timer.stop()
         except Exception:

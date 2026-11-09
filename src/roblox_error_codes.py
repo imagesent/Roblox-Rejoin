@@ -73,12 +73,31 @@ ERROR_CODES: dict[int, tuple[str, str]] = {
     503: (CATEGORY_RETRY, "Roblox server error"),
     504: (CATEGORY_RETRY, "Roblox server error"),
     507: (CATEGORY_RETRY, "Roblox server error"),
+    # Roblox reports failures of its own join web request as "A Http error has
+    # occurred. Please close the client and try again." with the HTTP status as
+    # the error code, so 5xx codes there mean "the join request failed, retry".
+    520: (CATEGORY_RETRY, "Roblox join request failed (HTTP error)"),
+    521: (CATEGORY_RETRY, "Roblox join request failed (HTTP error)"),
+    522: (CATEGORY_RETRY, "Roblox join request failed (HTTP error)"),
+    523: (CATEGORY_RETRY, "Roblox join request failed (HTTP error)"),
+    524: (CATEGORY_RETRY, "Roblox join request timed out (HTTP error)"),
+    525: (CATEGORY_RETRY, "Roblox join request failed (HTTP error)"),
+    526: (CATEGORY_RETRY, "Roblox join request failed (HTTP error)"),
+    527: (CATEGORY_RETRY, "Roblox join request failed (HTTP error)"),
+    529: (CATEGORY_RETRY, "Roblox is overloaded (HTTP error)"),
+    530: (CATEGORY_RETRY, "Roblox join request failed (HTTP error)"),
 }
 
 DEFAULT_CATEGORY = CATEGORY_DISCONNECT
 DEFAULT_LABEL = "removed from the game"
 
 _ERROR_CODE_RE = re.compile(r"error code\s*:?\s*(\d{1,4})", re.IGNORECASE)
+
+# Wording Roblox uses for its own failed join request; used to recognise the
+# dialog and to describe it when no numeric code is shown.
+HTTP_ERROR_RE = re.compile(
+    r"http error|https error|has occurred\.?\s*please close the client",
+    re.IGNORECASE)
 
 # Phrases a log line can contain that identify why a client died, used when
 # the client dies without leaving a dialog open.
@@ -93,6 +112,20 @@ def classify(code: int | None) -> tuple[str, str]:
     if code is None:
         return DEFAULT_CATEGORY, DEFAULT_LABEL
     return ERROR_CODES.get(int(code), (DEFAULT_CATEGORY, DEFAULT_LABEL))
+
+
+def http_error_reason(blob: str) -> str | None:
+    """A readable reason for Roblox's "A Http error has occurred" dialog."""
+    if not HTTP_ERROR_RE.search(blob or ""):
+        return None
+    m = _ERROR_CODE_RE.search(blob)
+    if m:
+        code = int(m.group(1))
+        category, label = classify(code)
+        if int(code) in ERROR_CODES:
+            return f"{label} (Error Code: {code})"
+        return f"Roblox join request failed (Error Code: {code})"
+    return "Roblox join request failed (HTTP error) \u2014 retrying"
 
 
 def is_stop_category(category: str) -> bool:
@@ -134,6 +167,9 @@ def reason_from_dialog(blob: str, limit: int = 160) -> tuple[str, int | None]:
         return reason, code
     if int(code) in ERROR_CODES:
         return f"{label} (Error Code: {code})", code
+    http = http_error_reason(blob)
+    if http:
+        return http, code
     return f"{msg} (Error Code: {code})", code
 
 

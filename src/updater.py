@@ -84,21 +84,39 @@ def fetch_latest(repo: str = GITHUB_REPO, timeout: int = 15) -> dict | None:
             "published": str(data.get("published_at") or "")}
 
 
-def cleanup_stale(target: str) -> None:
-    """Delete leftovers from earlier updates (.old backup, partial .update)."""
+def stale_files(target: str) -> list:
+    """Leftovers from earlier updates: the renamed backup and any partial
+    download, sitting next to the running exe."""
     if not target:
-        return
+        return []
+    folder = os.path.dirname(target) or "."
+    base = os.path.basename(target)
+    out = []
     try:
-        for name in os.listdir(os.path.dirname(target) or "."):
-            full = os.path.join(os.path.dirname(target), name)
-            if name.startswith(os.path.basename(target)) and (
-                    ".old" in name or ".update" in name):
-                try:
-                    os.remove(full)
-                except OSError:
-                    pass   # still locked (previous instance exiting) — next time
+        for name in os.listdir(folder):
+            if name.startswith(base) and (".old" in name or ".update" in name):
+                out.append(os.path.join(folder, name))
     except OSError:
-        pass
+        return []
+    return out
+
+
+def cleanup_stale(target: str) -> bool:
+    """Delete leftovers from earlier updates (.old backup, partial .update).
+
+    Returns True when nothing is left behind. A leftover is usually the
+    renamed *previous* exe, which Windows keeps locked until that process has
+    fully exited - so a caller that gets False should try again shortly, not
+    just next launch (which is how a 60 MB .old file could linger)."""
+    if not target:
+        return True
+    removed_all = True
+    for full in stale_files(target):
+        try:
+            os.remove(full)
+        except OSError:
+            removed_all = False      # still locked (previous instance exiting)
+    return removed_all
 
 
 def download(url: str, dest: str, progress=None) -> bool:

@@ -16,7 +16,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 APP_NAME = "Roblox Rejoin"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 GITHUB_REPO = "imagesent/Roblox-Rejoin"
 RELEASE_ASSET = "Roblox Rejoiner.exe"
 UPDATE_CHECK_SECS = 6 * 3600   # automatic update check cadence
