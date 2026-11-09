@@ -6,7 +6,8 @@ appears below the bar across the window.
 
 ## Run the app
 
-Download [Roblox Rejoiner.exe](https://github.com/imagesent/Roblox-Rejoin/releases/latest/download/Roblox%20Rejoiner.exe)
+<!-- The release asset name uses a dot, not a space: Roblox.Rejoiner.exe -->
+Download [Roblox Rejoiner.exe](https://github.com/imagesent/Roblox-Rejoin/releases/latest/download/Roblox.Rejoiner.exe)
 from the latest release and run it on Windows. The standalone app does not
 require Python or a separate package installation.
 
