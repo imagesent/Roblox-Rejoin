@@ -15,7 +15,7 @@ import time
 
 from rejoiner_constants import STATE_PATH, RESULTS_PATH
 from account_storage import _atomic_write, read_remote_commands
-from roblox_api import parse_place_id, parse_share_link
+from roblox_api import parse_place_id, parse_join_link
 
 
 def publish_state(win) -> None:
@@ -36,6 +36,7 @@ def publish_state(win) -> None:
             "monitored": bool(win.is_monitored(uid)),
             "rejoin_delay": a.get("delay", "") or "",
             "place": a.get("place", "") or "",
+            "join_on": bool(a.get("join_on", True)),
             "crashes": win._crash_for(uid),
             "state": (row.get("state") if running else "idle") or "idle",
             "reason": (row.get("reason") or "") if running else "",
@@ -93,7 +94,8 @@ def _truthy(v) -> bool:
 
 def apply_command(win, cmd) -> tuple[bool, str]:
     action = cmd.get("action")
-    user = cmd.get("username")
+    # Bots send either "username" or the shorter "user"; accept both.
+    user = cmd.get("username") or cmd.get("user")
     value = cmd.get("value")
 
     flag_actions = {"kick_detect": "kick_detect", "diff_server": "diff_server",
@@ -108,18 +110,70 @@ def apply_command(win, cmd) -> tuple[bool, str]:
 
     if action == "join_server":
         v = str(value or "").strip()
-        if v.lower() in ("off", "false", "0", "no", ""):
+        low = v.lower()
+        # "off" turns the feature off; "on" reuses the saved link; "all"/"none"
+        # set every account at once; numbers pick the first N accounts.
+        if low in ("off", "false", "0", "no"):
             win.bridge_set_flag("join_server", False)
-            return True, "join-server off"
-        if v.lower() in ("on", "true", "1", "yes"):
+            return True, "join-server off - accounts use their own games"
+        if low in ("all", "every", "unlimited"):
+            changed = win.bridge_set_join_accounts(
+                [a.get("username", "") for a in win.accounts], True,
+                clear_others=True)
+            return True, (f"join-server on - every account gets the link "
+                          f"({changed} changed)")
+        if low in ("none", "nobody"):
+            changed = win.bridge_set_join_accounts(
+                [a.get("username", "") for a in win.accounts], False)
+            return True, f"no account uses the link ({changed} cleared)"
+        if low.isdigit():
+            accounts = [a for a in win.accounts if a.get("cookie")]
+            names = [a.get("username", "") for a in accounts][:int(low)]
+            if not names:
+                return False, "no accounts to send to the private server"
+            changed = win.bridge_set_join_accounts(names, True,
+                                                  clear_others=True)
+            return True, (f"join-server on - the first {len(names)} account(s) "
+                          f"get the private-server link ({changed} changed)")
+        if low in ("on", "true", "1", "yes"):
             win.bridge_set_flag("join_server", True)
-            return True, "join-server on (using saved link)"
-        code, _ = parse_share_link(v)
-        if not code:
-            return False, "that isn't a valid share / private-server link"
+            chosen = [a for a in win.accounts if a.get("cookie")
+                      and a.get("join_on", True) is not False]
+            return True, ("join-server on - "
+                          + (", ".join(a.get("username", "?")
+                                       for a in chosen[:6])
+                             or "no account")
+                          + " get the link")
+        if parse_join_link(v) is None:
+            return False, ("that isn't a valid share / private-server link - "
+                           "expected a roblox.com/share?code=... link, a "
+                           "privateServerLinkCode link, or a job id")
         win.bridge_set_join_url(v)
         win.bridge_set_flag("join_server", True)
-        return True, "join-server set to that link"
+        chosen = [a for a in win.accounts if a.get("cookie")
+                  and a.get("join_on", True) is not False]
+        return True, ("join-server set to that link - "
+                      + (", ".join(a.get("username", "?")
+                                   for a in chosen[:6]) or "no account"))
+
+    if action == "account_join":
+        # "on"/"off" for one account, or a comma-separated list of names in
+        # the value to tick exactly those accounts.
+        if "," in str(value or "") or str(value or "").strip().lower() in (
+                "none", "nobody"):
+            names = [n.strip().lower() for n in str(value or "").split(",")]
+            changed = win.bridge_set_join_accounts(names, True)
+            if not changed:
+                return False, "none of those accounts exist"
+            return True, f"{changed} account(s) now get the private-server link"
+        a = win.account_by_name(user)
+        if not a:
+            return False, f"no account '{user}'"
+        want = _truthy(value)
+        win.bridge_set_account_join(a["user_id"], want)
+        return True, (f"{a['username']} "
+                      + ("joins" if want else "skips")
+                      + " the private server")
 
     if action == "account":
         a = win.account_by_name(user)

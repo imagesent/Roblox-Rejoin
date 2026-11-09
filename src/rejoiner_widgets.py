@@ -609,6 +609,124 @@ class AnimatedStack(QWidget):
         grp.start()
 
 
+# A dropdown whose face is a single row, so a list of choices takes almost no
+# space until it is opened. Qt.Popup gives the outside-click dismissal and
+# shadow for free, the way a menu behaves.
+class DropdownCard(QFrame):
+    """One-row control that opens a popup panel when clicked.
+
+    `label` names the control, `summary` describes the current choice, and the
+    panel is whatever widget the caller builds into `body()`."""
+
+    opened = Signal()
+
+    def __init__(self, label: str, summary: str = "", parent=None):
+        super().__init__(parent)
+        self.setObjectName("Card")
+        self.setCursor(Qt.PointingHandCursor)
+        self._open = False
+        row = QHBoxLayout(self)
+        row.setContentsMargins(16, 11, 16, 11)
+        row.setSpacing(12)
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        self.label_lbl = QLabel(label)
+        self.label_lbl.setObjectName("RowTitle")
+        col.addWidget(self.label_lbl)
+        self.summary_lbl = QLabel(summary)
+        self.summary_lbl.setObjectName("RowSub")
+        col.addWidget(self.summary_lbl)
+        row.addLayout(col)
+        row.addStretch(1)
+        chevron = QLabel("\u203a")
+        chevron.setObjectName("RowTitle")
+        chevron.setFixedWidth(12)
+        row.addWidget(chevron, 0, Qt.AlignVCenter)
+        self.setMinimumHeight(52)
+        # One row tall no matter how much room the page has left over.
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_summary(self, text: str):
+        self.summary_lbl.setText(text)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.toggle_popup()
+        super().mousePressEvent(event)
+
+    def toggle_popup(self):
+        panel = self.popup()
+        if panel and self._open:
+            panel.close()
+            self._open = False
+            return
+        if not panel:
+            return
+        # Always show the current state: the caller refreshes on this signal.
+        self.opened.emit()
+        panel.adjustSize()
+        wanted = self.popup_height()
+        screen = QApplication.primaryScreen()
+        bounds = screen.availableGeometry() if screen else None
+        # A dropdown hangs off its control, not off the window.
+        width = max(320, self.width())
+        if bounds is not None:
+            width = min(width, bounds.width() - 48)
+        height = (wanted if wanted is not None
+                  else panel.sizeHint().height())
+        if bounds is not None:
+            height = min(height, bounds.height() - 120)
+        panel.resize(width, height)
+        pos = self.mapToGlobal(QPoint(0, self.height() + 2))
+        # Flip above when it would fall off the bottom of the screen.
+        if bounds is not None and pos.y() + height > bounds.bottom():
+            pos = self.mapToGlobal(QPoint(0, -height - 2))
+        panel.move(pos)
+        panel.show()
+        panel.raise_()
+        self._open = True
+
+    def popup(self) -> QFrame | None:
+        return None
+
+    def popup_height(self) -> int | None:
+        """Preferred popup height, or None to size it to its own layout.
+
+        A layout's sizeHint understates a scrollable list, so callers with a
+        known row count override this."""
+        return None
+
+    def eventFilter(self, obj, event):
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.Close:
+            self._open = False
+        return super().eventFilter(obj, event)
+
+
+# A row that behaves like a menu item: hover highlight and a click anywhere.
+class ClickableRow(QFrame):
+    """Full-row hit target, for lists where the switch is the small part.
+
+    Clicking anywhere on the row emits `clicked`; the caller decides what a
+    click means, so a whole account line can toggle its own switch."""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("DropdownRow")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setAttribute(Qt.WA_Hover, True)
+        # Transparent by default so the popup's own background shows through.
+        self.setStyleSheet("background: transparent;")
+
+    def mouseReleaseEvent(self, event):
+        if (event.button() == Qt.LeftButton
+                and self.rect().contains(event.position().toPoint())):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
 # Reusable cards, separators, and page layout components.
 def make_card() -> QFrame:
     c = QFrame()

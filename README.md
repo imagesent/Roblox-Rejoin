@@ -6,7 +6,7 @@ appears below the bar across the window.
 
 ## Run the app
 
-Download [Roblox Rejoiner.exe](https://github.com/imagesent/Roblox-Rejoin/releases/latest/download/Roblox.Rejoiner.exe)
+Download [Roblox Rejoiner.exe](https://github.com/imagesent/Roblox-Rejoin/releases/latest/download/Roblox%20Rejoiner.exe)
 from the latest release and run it on Windows. The standalone app does not
 require Python or a separate package installation.
 
@@ -42,8 +42,62 @@ To run the app from source or build the standalone executable:
    Relaunches are queued and staggered to avoid mixing up Roblox client
    processes.
 
+## Private servers and specific servers
+
+**Rejoiner Setup** → **Join a specific server** decides where monitored accounts
+are sent. Paste a link from **any** of the shapes Roblox uses:
+
+| What you have | Example |
+| --- | --- |
+| The link on your private server | `https://www.roblox.com/games/123/Game?privateServerLinkCode=…` |
+| A share link | `https://www.roblox.com/share?code=…&type=Server` |
+| One specific public server | `https://www.roblox.com/games/123/Game?gameInstanceId=…` (or a job id) |
+| A game, any server | `https://www.roblox.com/games/123/Game` or a bare Place ID |
+
+**Which accounts** the link applies to is one compact row - *"Send these
+accounts to the private server"* - that opens a dropdown listing your accounts.
+Ticked ones are sent to the private server, unticked ones use the game they
+were set up with (their **Game / place** row, or the default place on Rejoiner
+Setup). All / None clears the set in one click, the row's summary counts them
+("1 of 3 accounts sent to the private server"), and the same switch lives on
+each account's own row under **Manage Accounts** - both write to the same
+setting. So sending exactly one account into the private server while the rest
+keep farming their own games is a single click, whichever page you are on.
+
+**Pick a server…** searches Roblox by game name — the same search the Setup
+page uses, icons and all — then lists *that game's* private servers, or every
+private server the account owns with *All my private servers*, and fills in the
+join link for you so links never have to be copied out of a browser. The list
+only ever contains servers the account actually owns; when the game you picked
+has none, it says so instead of showing every server you have.
+
+Press **Check link** before starting: the app reports what the link points at
+(private server, one specific server, or the game itself) and which place and
+server Roblox actually resolved.
+
+If a link cannot be resolved, the account waits with the reason on screen
+instead of being launched into public matchmaking — the failure that used to
+dump whole batches into random servers. After five failed attempts the account
+stops and says the link needs fixing.
+
+While monitoring, each join is verified against the server the link pointed at:
+a client that lands elsewhere is rejoined (up to three times), after which the
+reason is logged and the account is left where Roblox put it — private servers
+get a new job id whenever Roblox restarts them, so the engine believes the
+majority of accounts over a stale lookup.
+
+Discord embeds are branded with the app's own icon rather than the game's
+thumbnail, so notifications from the tool are recognisable at a glance.
+
+The same settings are available to the Discord bot through the state/command
+bridge: `join_server` accepts `on`, `off`, `all`, `none`, a number of accounts,
+or a link; `account_join` ticks the private server for one account, or for a
+comma-separated list of names.
+
 Session cookies are sensitive credentials, so only paste cookies for accounts
 you own. On Windows, saved cookies are encrypted with DPAPI.
+
+The **Settings** page holds the Roblox installation folder, the Discord webhook and the app's automatic self-update settings in one place.
 
 Optional Discord notifications are sent as color-coded embeds — one clean
 card per event (launch, crash, kick, disconnect, server move, stop) with the
@@ -72,6 +126,23 @@ retry delay increases up to 60 seconds between attempts.
 
 Multi-account settings and encrypted cookies are stored under
 `%APPDATA%\Roblox Rejoin`.
+
+## Development
+
+Run the test suite from the repository root:
+
+```
+python -m unittest discover -s tests -p "test_*.py" -v
+python tests/smoke_ui.py
+```
+
+The unit tests cover link parsing and launch-URI building, share-link
+resolution, and the engine's private-server targets (including that a
+link which will not resolve holds its account back instead of falling back
+to a public server). `tests/smoke_ui.py` builds the whole interface against
+a stubbed Roblox API and checks the join-link settings, the per-account
+overrides, and the bot bridge commands. Neither needs a network connection
+or an account.
 
 ## Support
 

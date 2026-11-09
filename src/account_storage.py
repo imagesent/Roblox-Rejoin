@@ -172,9 +172,14 @@ def load_config() -> dict:
     accounts = cfg.get("accounts")
     if isinstance(accounts, list):
         for account in accounts:
-            if isinstance(account, dict) and "killmin" in account:
-                del account["killmin"]
-                removed_obsolete_settings = True
+            if not isinstance(account, dict):
+                continue
+            # Retired per-account settings: the private-server link is now
+            # shared from the Setup page, and killmin is long gone.
+            for obsolete in ("killmin", "join_url"):
+                if obsolete in account:
+                    del account[obsolete]
+                    removed_obsolete_settings = True
     cfg.setdefault("accounts", [])
     cfg.setdefault("place", "")
     cfg.setdefault("delay", "60")

@@ -24,9 +24,10 @@ from rejoiner_colors import (fmt_dur, ACCENT, ACCENT_SOFT, GOOD, WARN, BAD, MUTE
                       TEXT, CARD2)
 from account_storage import load_config, save_config, dpapi_encrypt, dpapi_decrypt
 from roblox_account_profiles import ProfileFetcher, PresenceFetcher
-from roblox_api import (get_account_info, parse_place_id, parse_share_link,
-                       resolve_share_link, search_roblox_games,
-                       fetch_game_icons, GameSearchResult)
+from roblox_api import (get_account_info, parse_place_id, parse_join_link,
+                       resolve_join_link, JoinTarget, search_roblox_games,
+                       fetch_game_icons, GameSearchResult,
+                       fetch_private_servers, generate_private_server_link)
 from discord_notifications import (_is_discord_webhook, discord_post,
                                    make_embed, COLOR_GOOD)
 
@@ -35,7 +36,8 @@ import updater
 
 from rejoiner_theme import pick_fonts, build_stylesheet, THEMES, set_theme as set_palette, BG
 from rejoiner_widgets import (IOSSwitch, TopNavBar, AnimatedStack, Avatar,
-                        StatTile, StatusDot, make_card, hsep)
+                         StatTile, StatusDot, make_card, hsep,
+                         DropdownCard, ClickableRow)
 from multi_account_monitor_engine import MonitorEngine
 
 
@@ -263,6 +265,498 @@ class AddRobloxAccountDialog(QDialog):
         self.accept()
 
 
+class JoinAccountsDropdown(DropdownCard):
+    """Compact control for choosing which accounts join the private server.
+
+    The face of the control is one row ("Send these accounts to the private
+    server - 1 of 3 selected"); the list itself opens as a popup, so the Setup
+    page stays short no matter how many accounts are saved. The same switches
+    live on each account's own row, and both write to one setting."""
+
+    def __init__(self, win: "MainWindow", parent=None):
+        super().__init__("Send these accounts to the private server",
+                         "", parent)
+        self.win = win
+        self._panel = QFrame(self, Qt.Popup)
+        self._panel.setObjectName("DropdownPopup")
+        self._rows: dict[int, QLabel] = {}
+        self._build_panel()
+        # Rebuild from the accounts every time the menu opens, so it can never
+        # show stale switches.
+        self.opened.connect(self.refresh)
+
+    # -- popup contents ---------------------------------------------------
+    def _build_panel(self):
+        lay = QVBoxLayout(self._panel)
+        lay.setContentsMargins(0, 6, 0, 8)
+        lay.setSpacing(0)
+
+        header = QWidget()
+        hh = QHBoxLayout(header)
+        hh.setContentsMargins(16, 10, 16, 6)
+        hh.setSpacing(8)
+        cap = QLabel("Accounts sent to the private server")
+        cap.setObjectName("RowTitle")
+        hh.addWidget(cap)
+        hh.addStretch(1)
+        for label, on in (("All", True), ("None", False)):
+            btn = QPushButton(label)
+            btn.setObjectName("Link")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _c=False, v=on: self._set_all(v))
+            hh.addWidget(btn)
+        lay.addWidget(header)
+        lay.addWidget(hsep())
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.NoFrame)
+        host = QWidget()
+        self._list_lay = QVBoxLayout(host)
+        self._list_lay.setContentsMargins(0, 0, 0, 0)
+        self._list_lay.setSpacing(0)
+        scroll.setWidget(host)
+        lay.addWidget(scroll)
+        self._panel.setMinimumWidth(320)
+        self._panel.setMinimumHeight(120)
+        self._panel.setMaximumHeight(420)
+        self._empty = QLabel("No accounts yet — add one on Manage "
+                             "Accounts to choose who joins the private server.")
+        self._empty.setObjectName("Muted")
+        self._empty.setWordWrap(True)
+        self._empty.hide()
+        self._list_lay.addWidget(self._empty)
+
+    def popup(self) -> QFrame | None:
+        return self._panel
+
+    def popup_height(self) -> int | None:
+        """Menu-sized to the account list it is about to show."""
+        n = len(self._rows)
+        if not n:
+            return None
+        return min(420, 104 + 48 * n)
+
+    def refresh(self):
+        """Rebuild the list and the face of the control from the accounts."""
+        self.set_summary(self._summary())
+        lay = self._list_lay
+        for i in reversed(range(lay.count())):
+            w = lay.itemAt(i).widget()
+            if w is not None and w is not self._empty:
+                w.setParent(None)
+        self._rows.clear()
+        accounts = [a for a in self.win.accounts if a.get("cookie")]
+        if not accounts:
+            self._empty.show()
+            return
+        self._empty.hide()
+        # One row per account, capped so a long list still opens as a menu.
+        self._panel.setMaximumHeight(min(420, 150 + 46 * len(accounts)))
+        # Accounts the app will actually launch come first: an account that is
+        # not monitored can never join the private server, so it should not
+        # sit above the ones that can.
+        accounts.sort(key=lambda a: (not self.win.is_monitored(a["user_id"]),
+                                     (a.get("alias") or a.get("username")
+                                      or "").lower()))
+        for acc in accounts:
+            lay.addWidget(self._account_row(acc))
+        lay.addStretch(1)
+        self._panel.setMinimumHeight(self.popup_height() or 0)
+
+    def _account_row(self, acc: dict) -> QWidget:
+        """One account line: click anywhere to toggle, switch inside it too."""
+        uid = acc["user_id"]
+        monitored = self.win.is_monitored(uid)
+        row = ClickableRow()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(16, 8, 16, 8)
+        rl.setSpacing(12)
+        avatar = Avatar(acc.get("alias") or acc.get("username", "?"), 34)
+        avatar.set_presence("online" if monitored else None)
+        rl.addWidget(avatar, 0, Qt.AlignVCenter)
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        name = QLabel(acc.get("alias") or acc.get("username", "account"))
+        name.setObjectName("RowTitle")
+        col.addWidget(name)
+        sub = QLabel(self._where(acc, monitored))
+        sub.setObjectName("RowSub")
+        col.addWidget(sub)
+        rl.addLayout(col)
+        rl.addStretch(1)
+        switch = IOSSwitch(bool(acc.get("join_on", True)))
+        # Clicking anywhere on the line does the same as the switch, so the
+        # whole row is one comfortable target.
+        row.clicked.connect(
+            lambda s=switch: (s.setChecked(not s.isChecked()),
+                              s.toggled.emit(s.isChecked())))
+        switch.toggled.connect(
+            lambda v, u=uid: self.win.set_account_join(u, v))
+        rl.addWidget(switch, 0, Qt.AlignVCenter)
+        self._rows[uid] = sub
+        return row
+
+    @staticmethod
+    def _where(acc: dict, monitored: bool = True) -> str:
+        if acc.get("join_on", True):
+            what = "joins the private server"
+        else:
+            place = str(acc.get("place") or "").strip()
+            what = f"uses game {place}" if place else "uses the default game"
+        if not monitored:
+            what += " (not monitored, so it stays off)"
+        return what
+
+    def _set_all(self, on: bool):
+        for acc in self.win.accounts:
+            if acc.get("cookie"):
+                self.win.set_account_join(acc["user_id"], on)
+
+    def _summary(self) -> str:
+        accounts = [a for a in self.win.accounts if a.get("cookie")]
+        if not accounts:
+            return "No accounts added yet"
+        chosen = [a for a in accounts if a.get("join_on", True) is not False]
+        unmonitored = [a for a in accounts
+                       if not self.win.is_monitored(a["user_id"])]
+        base = (f"{len(chosen)} of {len(accounts)} account"
+                + ("" if len(accounts) == 1 else "s")
+                + " sent to the private server")
+        if unmonitored:
+            base += (f" \u2014 {len(unmonitored)} not monitored on Manage "
+                     f"Accounts")
+        return base
+
+class PrivateServerDialog(QDialog):
+    """Pick one of the account's own private servers and use its join link.
+
+    Search Roblox by game name (or load every game the account has private
+    servers in), then pick the server. Roblox hands back a join link for each
+    one, so nobody has to copy links out of a browser by hand. Every request
+    runs on a worker thread while the dialog stays responsive."""
+
+    _loaded = Signal(object)
+
+    def __init__(self, win: "MainWindow", parent=None):
+        super().__init__(parent or win)
+        self.win = win
+        self.setWindowTitle("Use one of your private servers")
+        self.setMinimumSize(720, 620)
+        self.setStyleSheet(f"QDialog {{ background:{BG}; }}")
+        self._rows: list[dict] = []
+        self._place_id = ""
+        self._searching = False
+        self._loaded.connect(self._on_loaded)
+        self._all_rows: list[dict] = []      # everything, before the filter
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 22, 24, 20)
+        lay.setSpacing(10)
+
+        title = QLabel("Use one of your private servers")
+        title.setObjectName("H2")
+        lay.addWidget(title)
+        sub = QLabel("Pick the game, then pick the server. The search looks "
+                     "up every Roblox experience by name.")
+        sub.setObjectName("Muted")
+        sub.setWordWrap(True)
+        lay.addWidget(sub)
+
+        picker = QHBoxLayout()
+        picker.setSpacing(8)
+        self.account_combo = QComboBox()
+        for a in win.accounts:
+            if a.get("cookie"):
+                self.account_combo.addItem(
+                    a.get("alias") or a.get("username") or "account",
+                    a["user_id"])
+        picker.addWidget(QLabel("Account:"), 0, Qt.AlignVCenter)
+        picker.addWidget(self.account_combo, 1)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search games by name")
+        self.search_edit.returnPressed.connect(self.search_games)
+        picker.addWidget(self.search_edit, 2)
+        self.search_btn = QPushButton("Search")
+        self.search_btn.setObjectName("Ghost")
+        self.search_btn.setCursor(Qt.PointingHandCursor)
+        self.search_btn.clicked.connect(self.search_games)
+        picker.addWidget(self.search_btn)
+        lay.addLayout(picker)
+
+        any_row = QHBoxLayout()
+        any_row.setSpacing(8)
+        self.all_games_btn = QPushButton("All my private servers")
+        self.all_games_btn.setObjectName("Link")
+        self.all_games_btn.setCursor(Qt.PointingHandCursor)
+        self.all_games_btn.setToolTip("List every private server this account "
+                                      "owns, whatever the game")
+        self.all_games_btn.clicked.connect(self.use_all_games)
+        any_row.addWidget(self.all_games_btn)
+        any_row.addStretch(1)
+        self.reload_btn = QPushButton("Load servers")
+        self.reload_btn.setObjectName("Primary")
+        self.reload_btn.setCursor(Qt.PointingHandCursor)
+        self.reload_btn.clicked.connect(self.load)
+        any_row.addWidget(self.reload_btn)
+        lay.addLayout(any_row)
+
+        self.search_status = QLabel("")
+        self.search_status.setObjectName("RowSub")
+        self.search_status.setWordWrap(True)
+        lay.addWidget(self.search_status)
+
+        self.games = QListWidget()
+        self.games.setObjectName("GameResults")
+        self.games.setIconSize(QSize(40, 40))
+        self.games.setFixedHeight(3 * 56 + 4)
+        self.games.setVisible(False)
+        self.games.currentItemChanged.connect(self._show_game_details)
+        self.games.itemClicked.connect(self._pick_game)
+        lay.addWidget(self.games)
+
+        self.status = QLabel("Search for the game, or list every private "
+                             "server this account owns.")
+        self.status.setObjectName("RowSub")
+        self.status.setWordWrap(True)
+        lay.addWidget(self.status)
+
+        self.list = QListWidget()
+        self.list.setObjectName("GameResults")
+        self.list.setIconSize(QSize(40, 40))
+        self.list.itemDoubleClicked.connect(self._use_item)
+        lay.addWidget(self.list, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.link_btn = QPushButton("Use this server")
+        self.link_btn.setObjectName("Primary")
+        self.link_btn.setCursor(Qt.PointingHandCursor)
+        self.link_btn.setEnabled(False)
+        self.link_btn.clicked.connect(self.use_selected)
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("Ghost")
+        close_btn.clicked.connect(self.reject)
+        buttons.addWidget(self.link_btn)
+        buttons.addWidget(close_btn)
+        lay.addLayout(buttons)
+
+    def _account(self) -> dict | None:
+        uid = self.account_combo.currentData()
+        return next((a for a in self.win.accounts if a["user_id"] == uid), None)
+
+    # --- game search (same behaviour as the Setup page's) ------------------
+    def search_games(self):
+        if self._searching:
+            return
+        query = self.search_edit.text().strip()
+        if not query:
+            return
+        self._searching = True
+        self.search_btn.setText("Searching...")
+        self.search_btn.setEnabled(False)
+        self.games.clear()
+        self.games.setVisible(False)
+        self.search_status.setText(f"Searching Roblox for \"{query}\"...")
+        self.search_status.setVisible(True)
+
+        def work():
+            try:
+                results = search_roblox_games(query)
+                error = ""
+            except Exception as e:
+                results, error = [], str(e)
+            try:
+                icons = fetch_game_icons(
+                    [g["universe_id"] for g in results])
+            except Exception:
+                icons = {}
+            for game in results:
+                game["icon_data"] = icons.get(game["universe_id"], b"")
+            self._loaded.emit({"search": True, "results": results,
+                               "error": error})
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_search_done(self, payload: dict):
+        self._searching = False
+        self.search_btn.setText("Search")
+        self.search_btn.setEnabled(True)
+        results = payload.get("results") or []
+        self.games.clear()
+        if payload.get("error"):
+            self.search_status.setText(f"Game search failed: "
+                                       f"{payload['error']}")
+            return
+        if not results:
+            self.search_status.setText(
+                f"No games found for \"{self.search_edit.text().strip()}\".")
+            return
+        for game in results:
+            pixmap = QPixmap()
+            if game.get("icon_data"):
+                pixmap.loadFromData(game["icon_data"], "PNG")
+            icon = QIcon(pixmap) if not pixmap.isNull() else QIcon()
+            item = QListWidgetItem(icon,
+                                   f"{game['name']} \u2014 {game['creator']}")
+            item.setData(Qt.UserRole, game)
+            item.setSizeHint(QSize(0, 56))
+            self.games.addItem(item)
+        self.games.setVisible(True)
+        self.games.setCurrentRow(0)
+        self.search_status.setText(f"{len(results)} game"
+                                   + ("s" if len(results) != 1 else "")
+                                   + " found - click one to list its private "
+                                     "servers.")
+
+    def _show_game_details(self, current=None, previous=None):
+        game = current.data(Qt.UserRole) if current else None
+        if isinstance(game, dict):
+            self.search_status.setText(
+                f"{game['name']} \u2014 Creator: {game['creator']}")
+
+    def _pick_game(self, item=None):
+        item = item or self.games.currentItem()
+        game = item.data(Qt.UserRole) if item else None
+        if not isinstance(game, dict):
+            return
+        self._place_id = str(game["root_place_id"])
+        self.games.setVisible(False)
+        self.search_status.setText(
+            f"Game: {game['name']} \u2014 Place ID {self._place_id}. Loading "
+            f"its private servers...")
+        self.search_status.setStyleSheet(f"color:{ACCENT_SOFT};")
+        self.load()
+
+    def use_all_games(self):
+        self._place_id = ""
+        self.games.setVisible(False)
+        self.search_status.setText("Loading every private server this account "
+                                   "owns...")
+        self.search_status.setStyleSheet(f"color:{ACCENT_SOFT};")
+        self.load()
+
+    def load(self):
+        acc = self._account()
+        if not acc or not acc.get("cookie"):
+            self.status.setText("Add an account with its cookie first.")
+            return
+        place = self._place_id
+        self.status.setText("Asking Roblox for this account's private servers...")
+        self.reload_btn.setEnabled(False)
+        self.list.clear()
+        self.link_btn.setEnabled(False)
+        self._rows = []
+
+        def work():
+            try:
+                rows, err = fetch_private_servers(acc["cookie"], acc["user_id"],
+                                                  place_id=place)
+            except Exception as e:
+                rows, err = [], f"load failed ({e})"
+            self._loaded.emit({"rows": rows, "error": err})
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_loaded(self, payload: dict):
+        if payload.get("search"):
+            self._on_search_done(payload)
+            return
+        self.reload_btn.setEnabled(True)
+        # Roblox falls back to listing *every* server when the account has
+        # none in the game that was asked for, which reads as "my server is
+        # not here". Filter by the game that was actually picked.
+        self._all_rows = payload.get("rows") or []
+        self._rows = self._filtered()
+        self._render()
+
+    def _filtered(self) -> list[dict]:
+        """Only the servers of the game that was actually chosen.
+
+        Roblox's own endpoints return *every* server an account owns when the
+        requested game has none, which reads as "my server is not here". So
+        the list is narrowed to the game the search picked, and the empty case
+        is reported clearly."""
+        place = str(self._place_id or "").strip()
+        if not place:
+            return list(self._all_rows)
+        return [r for r in self._all_rows
+                if str(r.get("place_id", "")) == place]
+
+    def _render(self):
+        """Show the filtered servers, or a clear message when there are none."""
+        rows = self._rows
+        self.list.clear()
+        self.link_btn.setEnabled(bool(rows))
+        if self._all_rows and not rows:
+            self.status.setText(
+                "This account has no private server in the game you picked "
+                "(only its own private servers are listed). Choose All my "
+                "private servers to see every game.")
+            return
+        if not self._all_rows:
+            self.status.setText(
+                "This account owns no private servers"
+                + (" in that game" if self._place_id else "")
+                + " - Roblox only lists servers this account owns.")
+            return
+        self.status.setText(f"{len(rows)} private server"
+                            + ("s" if len(rows) != 1 else "")
+                            + " - select one to use its join link.")
+        for row in rows:
+            text = (f"{row['name']}  -  {row['game']}"
+                    + ("" if row.get("active") else "  (inactive)"))
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, row)
+            if row.get("link"):
+                item.setToolTip(row["link"])
+            else:
+                item.setText(text + "  (no link - use Generate link)")
+            item.setSizeHint(QSize(0, 48))
+            self.list.addItem(item)
+        if rows:
+            self.list.setCurrentRow(0)
+
+    def use_selected(self):
+        item = self.list.currentItem()
+        if item:
+            self._use_item(item)
+
+    def _use_item(self, item):
+        row = item.data(Qt.UserRole) if item else None
+        if not row:
+            return
+        link = row.get("link") or ""
+        if not link:
+            self._generate_link(row)
+            return
+        self.win.apply_join_link(link, f"{row['name']} ({row['game']})")
+
+    def _generate_link(self, row: dict):
+        acc = self._account()
+        if not acc or not acc.get("cookie"):
+            return
+        self.status.setText("Asking Roblox for a fresh join link...")
+        self.reload_btn.setEnabled(False)
+
+        def work():
+            try:
+                link = generate_private_server_link(
+                    acc["cookie"], row.get("id", ""), row.get("place_id", ""))
+            except Exception:
+                link = ""
+            fresh = dict(row, link=link)
+            # Keep the other servers, with the new link in place of the old.
+            merged = [fresh if r.get("id") == row.get("id") else dict(r)
+                      for r in (self._all_rows or [row])]
+            self._loaded.emit({"rows": merged,
+                               "error": "" if link else
+                               "Roblox would not generate a link"})
+
+        threading.Thread(target=work, daemon=True).start()
+
+
 def _section(title: str) -> QLabel:
     lab = QLabel(title.upper())
     lab.setObjectName("Section")
@@ -331,7 +825,6 @@ def _page_scaffold(title: str, subtitle: str):
 # Settings page for appearance, game selection, and relaunch behavior.
 class SetupPage(QWidget):
     _game_search_complete = Signal(object)
-    _webhook_test_complete = Signal(object)
 
     def __init__(self, win: "MainWindow"):
         super().__init__()
@@ -344,6 +837,7 @@ class SetupPage(QWidget):
         lay.addWidget(page)
 
         cfg = win.cfg
+        self.body = body
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(THEMES)
         self.theme_combo.setCurrentText(win.theme_name)
@@ -425,33 +919,48 @@ class SetupPage(QWidget):
         body.addWidget(_section("Find a game"))
         body.addWidget(search_card)
 
-        # Optional share link used to send monitored accounts to one server.
+        # Share / private-server link used to send monitored accounts to one
+        # specific server. The link and the number of accounts it applies to
+        # are both editable, and each account can override the link.
         self.join_edit = QLineEdit(cfg.get("joinserver_url", ""))
         self.join_edit.setPlaceholderText("Roblox share / private-server link")
-        self.join_edit.editingFinished.connect(
-            lambda: win.set_setting("joinserver_url", self.join_edit.text().strip()))
+        self.join_edit.editingFinished.connect(self._join_link_edited)
         self.sw_join = self._switch("joinserver_on")
         check_btn = QPushButton("Check link")
         check_btn.setObjectName("Ghost")
         check_btn.setCursor(Qt.PointingHandCursor)
         check_btn.clicked.connect(
             lambda: win.check_join_link(self.join_edit.text().strip()))
+        pick_btn = QPushButton("Pick a server...")
+        pick_btn.setObjectName("Ghost")
+        pick_btn.setCursor(Qt.PointingHandCursor)
+        pick_btn.clicked.connect(self.win.open_private_server_picker)
         link_row = QWidget()
         lr = QHBoxLayout(link_row)
         lr.setContentsMargins(16, 11, 16, 11)
         lr.setSpacing(10)
         lr.addWidget(self.join_edit, 1)
         lr.addWidget(check_btn)
+        lr.addWidget(pick_btn)
         body.addWidget(_section("Join a specific server"))
         body.addWidget(_card_of([
-            _row("Join specific server", "Send every account to the same server "
-                 "from the link below", self.sw_join),
+            _row("Join specific server", "Send the accounts chosen below to "
+                 "the private-server link; everyone else uses their own game",
+                 self.sw_join),
             link_row,
         ]))
+        # Which accounts the link applies to. The list lives in a dropdown so
+        # the page stays compact: ticked accounts join the private server, the
+        # rest keep the game they were set up with on their own row.
+        self.join_dropdown = JoinAccountsDropdown(self.win)
+        body.addWidget(self.join_dropdown)
         self.join_status = QLabel("")
         self.join_status.setObjectName("RowSub")
+        self.join_status.setWordWrap(True)
         self.join_status.setContentsMargins(18, 0, 0, 0)
         body.addWidget(self.join_status)
+        self.refresh_join_accounts()
+        self.refresh_join_status()
 
         # Global delay applied before retrying a failed client.
         self.delay_edit = QLineEdit(str(cfg.get("delay", "60")))
@@ -481,137 +990,71 @@ class SetupPage(QWidget):
                  "start instead of launching", self.sw_detect),
         ]))
 
-        self.webhook_edit = QLineEdit(win.webhook_url)
-        self.webhook_edit.setPlaceholderText("https://discord.com/api/webhooks/…")
-        self.webhook_edit.setMinimumWidth(300)
-        self.webhook_edit.editingFinished.connect(
-            lambda: win.set_webhook(self.webhook_edit.text().strip()))
-        self.webhook_test_button = QPushButton("Send test message")
-        self.webhook_test_button.setObjectName("Ghost")
-        self.webhook_test_button.setCursor(Qt.PointingHandCursor)
-        self.webhook_test_button.clicked.connect(self.test_webhook)
-        self._webhook_test_complete.connect(self._on_webhook_test_complete)
-        webhook_row = QWidget()
-        webhook_layout = QHBoxLayout(webhook_row)
-        webhook_layout.setContentsMargins(0, 0, 0, 0)
-        webhook_layout.setSpacing(8)
-        webhook_layout.addWidget(self.webhook_edit, 1)
-        webhook_layout.addWidget(self.webhook_test_button)
-        body.addWidget(_section("Notifications"))
-        body.addWidget(_card_of([
-            _row("Discord webhook", "Color-coded embeds for launches, crashes, "
-                 "kicks, disconnects and stops — one clean card per event",
-                 webhook_row),
-        ]))
-        self.webhook_test_status = QLabel("")
-        self.webhook_test_status.setObjectName("RowSub")
-        self.webhook_test_status.setWordWrap(True)
-        self.webhook_test_status.setContentsMargins(18, 0, 0, 0)
-        body.addWidget(self.webhook_test_status)
-
-        # Automatic self-update from GitHub releases (standalone exe only).
-        self.update_check_btn = QPushButton("Check now")
-        self.update_check_btn.setObjectName("Ghost")
-        self.update_check_btn.setCursor(Qt.PointingHandCursor)
-        self.update_check_btn.clicked.connect(
-            lambda: self.win.check_updates(manual=True))
-        self.update_restart_btn = QPushButton("Restart & update")
-        self.update_restart_btn.setObjectName("Primary")
-        self.update_restart_btn.setCursor(Qt.PointingHandCursor)
-        self.update_restart_btn.clicked.connect(self.win.restart_for_update)
-        self.update_restart_btn.setVisible(False)
-        update_btns = QWidget()
-        ub = QHBoxLayout(update_btns)
-        ub.setContentsMargins(0, 0, 0, 0)
-        ub.setSpacing(8)
-        ub.addWidget(self.update_check_btn)
-        ub.addWidget(self.update_restart_btn)
-        body.addWidget(_section("App updates"))
-        body.addWidget(_card_of([
-            _row("Standalone app updates", "Checks GitHub releases "
-                 "automatically and installs new versions",
-                 update_btns),
-        ]))
-        self.update_status = QLabel(f"Version {APP_VERSION}")
-        self.update_status.setObjectName("RowSub")
-        self.update_status.setWordWrap(True)
-        self.update_status.setContentsMargins(18, 0, 0, 0)
-        body.addWidget(self.update_status)
-
         body.addStretch(1)
 
-    def set_update_status(self, info: dict):
-        """Reflect the updater state under the App updates card."""
-        state = info.get("state", "")
-        if state == "source":
-            text = ("Running from source — auto-update only applies to the "
-                    "standalone exe.")
-        elif state == "checking":
-            text = "Checking GitHub for a newer release…"
-        elif state == "uptodate":
-            text = (f"Version {APP_VERSION} — up to date "
-                    f"(latest release {info.get('tag', '?')}).")
-        elif state == "available":
-            text = f"{info.get('tag', '?')} available — downloading…"
-        elif state == "downloading":
-            text = (f"Downloading {info.get('tag', '?')}… "
-                    f"{info.get('progress', 0)}%")
-        elif state == "ready":
-            text = f"{info.get('tag', '?')} downloaded — restart to apply."
-        elif state == "error":
-            text = f"Update check failed: {info.get('error', '?')}"
-        else:
-            text = f"Version {APP_VERSION}"
-        self.update_status.setText(text)
-        self.update_restart_btn.setVisible(state == "ready")
+    def _join_link_edited(self):
+        self.win.set_setting("joinserver_url", self.join_edit.text().strip())
+        self.refresh_join_status()
 
-    def test_webhook(self):
-        url = self.webhook_edit.text().strip()
-        if not _is_discord_webhook(url):
-            self.webhook_test_status.setText(
-                "Enter a valid Discord webhook URL before testing.")
-            self.webhook_test_status.setVisible(True)
+    def refresh_join_accounts(self):
+        """Fill the dropdown's popup with the accounts that can be sent."""
+        dropdown = getattr(self, "join_dropdown", None)
+        if dropdown is None:
             return
+        dropdown.refresh()
 
-        self.win.set_webhook(url)
-        dc = self.win.cfg.get("discord", {})
-        username = dc.get("username", "Roblox Rejoiner")
-        avatar = dc.get("avatar", "")
-        self.webhook_test_button.setEnabled(False)
-        self.webhook_test_button.setText("Sending…")
-        self.webhook_test_status.setText("Sending test message to Discord…")
-        self.webhook_test_status.setVisible(True)
+    def refresh_join_row(self, uid):
+        """Update one account's line after its private-server choice changed."""
+        dropdown = getattr(self, "join_dropdown", None)
+        if dropdown is not None:
+            dropdown.refresh()
 
-        def send_test():
-            try:
-                emb = make_embed(
-                    title="ExampleAccount",
-                    description="This is how notifications arrive: one clean "
-                                "embed per event, with the account, place "
-                                "and server spelled out.",
-                    color=COLOR_GOOD,
-                    fields=[
-                        ("Event", "In game", False),
-                        ("Details", "**Place:** 8304191830\n"
-                         "**Server:** a1b2c3d4e5f6\n"
-                         "**Session:** up 5m 12s\n"
-                         "**Accounts online:** 2/3", False),
-                    ],
-                    footer="Roblox Rejoiner \u00b7 test message")
-                result = discord_post(url, username, avatar, embeds=[emb])
-            except Exception as exc:
-                result = (False, f"Send failed: {exc}")
-            self._webhook_test_complete.emit(result)
-
-        threading.Thread(target=send_test, daemon=True).start()
-
-    def _on_webhook_test_complete(self, result: tuple[bool, str]):
-        self.webhook_test_button.setEnabled(True)
-        self.webhook_test_button.setText("Test webhook")
-        ok, error = result
-        self.webhook_test_status.setText(
-            "Test message sent successfully." if ok
-            else f"Webhook test failed: {error}")
+    def refresh_join_status(self, verified: str = ""):
+        """Show what the link and the chosen accounts will actually do."""
+        dropdown = getattr(self, "join_dropdown", None)
+        if dropdown is not None:
+            dropdown.refresh()
+        """Show what the link and the chosen accounts will actually do."""
+        if not self.sw_join.isChecked():
+            self.join_status.setText(
+                "Off — every monitored account uses its own game.")
+            self.join_status.setStyleSheet(f"color:{MUTED};")
+            return
+        link = (self.join_edit.text().strip()
+                or str(self.win.cfg.get("joinserver_url", "") or "").strip())
+        if not link:
+            self.join_status.setText(
+                "On, but no link is set — paste a share / "
+                "private-server link above, or leave this off.")
+            self.join_status.setStyleSheet(f"color:{WARN};")
+            return
+        parsed = parse_join_link(link)
+        if parsed is None:
+            self.join_status.setText(
+                "That doesn't look like a Roblox share / private-server link.")
+            self.join_status.setStyleSheet(f"color:{BAD};")
+            return
+        kinds = {"private": "a private server",
+                 "job": "one specific server",
+                 "open": "that game (Roblox picks any server)"}
+        what = kinds.get(parsed.kind,
+                         "a share link (it resolves to the private server)")
+        chosen = [a for a in self.win.accounts
+                  if a.get("cookie") and a.get("join_on", True) is not False]
+        if not chosen:
+            self.join_status.setText(
+                f"The link points to {what}, but no account is chosen "
+                f"below — tick at least one.")
+            self.join_status.setStyleSheet(f"color:{WARN};")
+            return
+        names = ", ".join(a.get("alias") or a.get("username", "?")
+                          for a in chosen[:6])
+        more = "" if len(chosen) <= 6 else f" (+{len(chosen) - 6} more)"
+        self.join_status.setText(
+            f"Sending {names}{more} to {what}. Everyone else uses their own "
+            f"game."
+            + (f"\nLast check: {verified}" if verified else ""))
+        self.join_status.setStyleSheet(f"color:{ACCENT_SOFT};")
 
     def _default_place_edited(self):
         self.win.set_default_place(self.place_edit.text().strip())
@@ -782,13 +1225,15 @@ class SetupPage(QWidget):
 
 # Roblox installation settings page.
 class RobloxSettingsPage(QWidget):
+    _webhook_test_complete = Signal(object)
+
     def __init__(self, win: "MainWindow"):
         super().__init__()
         self.win = win
         cfg = win.cfg
         page, body = _page_scaffold(
-            "Roblox Settings",
-            "Choose which Roblox installation to use when launching clients.")
+            "Settings",
+            "Roblox installation, Discord notifications and app updates.")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(page)
@@ -800,6 +1245,7 @@ class RobloxSettingsPage(QWidget):
             r"e.g. C:\Users\You\AppData\Local\Roblox\Versions\version-abc123")
         self.path_edit.setMinimumWidth(360)
         self.path_edit.editingFinished.connect(self._path_typed)
+        self._webhook_test_complete.connect(self._on_webhook_test_complete)
         browse = QPushButton("Browse…")
         browse.setObjectName("Ghost")
         browse.setCursor(Qt.PointingHandCursor)
@@ -843,8 +1289,140 @@ class RobloxSettingsPage(QWidget):
 
         body.addWidget(_section("Roblox installation"))
         body.addWidget(card)
+
+        self.webhook_edit = QLineEdit(win.webhook_url)
+        self.webhook_edit.setPlaceholderText("https://discord.com/api/webhooks/…")
+        self.webhook_edit.setMinimumWidth(300)
+        self.webhook_edit.editingFinished.connect(
+            lambda: win.set_webhook(self.webhook_edit.text().strip()))
+        self.webhook_test_button = QPushButton("Send test message")
+        self.webhook_test_button.setObjectName("Ghost")
+        self.webhook_test_button.setCursor(Qt.PointingHandCursor)
+        self.webhook_test_button.clicked.connect(self.test_webhook)
+        self._webhook_test_complete.connect(self._on_webhook_test_complete)
+        webhook_row = QWidget()
+        webhook_layout = QHBoxLayout(webhook_row)
+        webhook_layout.setContentsMargins(0, 0, 0, 0)
+        webhook_layout.setSpacing(8)
+        webhook_layout.addWidget(self.webhook_edit, 1)
+        webhook_layout.addWidget(self.webhook_test_button)
+
+        # Automatic self-update from GitHub releases (standalone exe only).
+        self.update_check_btn = QPushButton("Check now")
+        self.update_check_btn.setObjectName("Ghost")
+        self.update_check_btn.setCursor(Qt.PointingHandCursor)
+        self.update_check_btn.clicked.connect(
+            lambda: self.win.check_updates(manual=True))
+        self.update_restart_btn = QPushButton("Restart & update")
+        self.update_restart_btn.setObjectName("Primary")
+        self.update_restart_btn.setCursor(Qt.PointingHandCursor)
+        self.update_restart_btn.clicked.connect(self.win.restart_for_update)
+        self.update_restart_btn.setVisible(False)
+        update_btns = QWidget()
+        ub = QHBoxLayout(update_btns)
+        ub.setContentsMargins(0, 0, 0, 0)
+        ub.setSpacing(8)
+        ub.addWidget(self.update_check_btn)
+        ub.addWidget(self.update_restart_btn)
+        self.update_status = QLabel(f"Version {APP_VERSION}")
+        self.update_status.setObjectName("RowSub")
+        self.update_status.setWordWrap(True)
+        self.update_status.setContentsMargins(18, 0, 0, 0)
+        body.addWidget(_section("Notifications"))
+        body.addWidget(_card_of([
+            _row("Discord webhook", "Color-coded embeds for launches, crashes, "
+                 "kicks, disconnects and stops — one clean card per event",
+                 webhook_row),
+        ]))
+        self.webhook_test_status = QLabel("")
+        self.webhook_test_status.setObjectName("RowSub")
+        self.webhook_test_status.setWordWrap(True)
+        self.webhook_test_status.setContentsMargins(18, 0, 0, 0)
+        body.addWidget(self.webhook_test_status)
+
+        body.addWidget(_section("App updates"))
+        body.addWidget(_card_of([
+            _row("Standalone app updates", "Checks GitHub releases "
+                 "automatically and installs new versions", update_btns),
+        ]))
+        body.addWidget(self.update_status)
         body.addStretch(1)
         QTimer.singleShot(150, self._rescan)
+
+    def set_update_status(self, info: dict):
+        """Reflect the updater state under the App updates card."""
+        state = info.get("state", "")
+        if state == "source":
+            text = ("Running from source — auto-update only applies to the "
+                    "standalone exe.")
+        elif state == "checking":
+            text = "Checking GitHub for a newer release…"
+        elif state == "uptodate":
+            text = (f"Version {APP_VERSION} — up to date "
+                    f"(latest release {info.get('tag', '?')}).")
+        elif state == "available":
+            text = f"{info.get('tag', '?')} available — downloading…"
+        elif state == "downloading":
+            text = (f"Downloading {info.get('tag', '?')}… "
+                    f"{info.get('progress', 0)}%")
+        elif state == "ready":
+            text = f"{info.get('tag', '?')} downloaded — restart to apply."
+        elif state == "error":
+            text = f"Update check failed: {info.get('error', '?')}"
+        else:
+            text = f"Version {APP_VERSION}"
+        self.update_status.setText(text)
+        self.update_restart_btn.setVisible(state == "ready")
+
+    def test_webhook(self):
+        """Send a sample embed, driven by this page's own fields."""
+        panel = self
+        url = panel.webhook_edit.text().strip()
+        if not _is_discord_webhook(url):
+            panel.webhook_test_status.setText(
+                "Enter a valid Discord webhook URL before testing.")
+            panel.webhook_test_status.setVisible(True)
+            return
+
+        self.win.set_webhook(url)
+        dc = self.win.cfg.get("discord", {})
+        username = dc.get("username", "Roblox Rejoiner")
+        avatar = dc.get("avatar", "")
+        panel.webhook_test_button.setEnabled(False)
+        panel.webhook_test_button.setText("Sending…")
+        panel.webhook_test_status.setText("Sending test message to Discord…")
+        panel.webhook_test_status.setVisible(True)
+
+        def send_test():
+            try:
+                emb = make_embed(
+                    title="ExampleAccount",
+                    description="This is how notifications arrive: one clean "
+                                "embed per event, with the account, place "
+                                "and server spelled out.",
+                    color=COLOR_GOOD,
+                    fields=[
+                        ("Event", "In game", False),
+                        ("Details", "**Place:** 8304191830\n"
+                         "**Server:** a1b2c3d4e5f6\n"
+                         "**Session:** up 5m 12s\n"
+                         "**Accounts online:** 2/3", False),
+                    ],
+                    footer="Roblox Rejoiner \u00b7 test message")
+                result = discord_post(url, username, avatar, embeds=[emb])
+            except Exception as exc:
+                result = (False, f"Send failed: {exc}")
+            self._webhook_test_complete.emit(result)
+
+        threading.Thread(target=send_test, daemon=True).start()
+
+    def _on_webhook_test_complete(self, result: tuple[bool, str]):
+        self.webhook_test_button.setEnabled(True)
+        self.webhook_test_button.setText("Test webhook")
+        ok, error = result
+        self.webhook_test_status.setText(
+            "Test message sent successfully." if ok
+            else f"Webhook test failed: {error}")
 
     def _rescan(self):
         self.detected_lbl.setText("Scanning for Roblox…")
@@ -942,6 +1520,13 @@ class AccountRow(QFrame):
         pl.addWidget(_row("Rejoin delay",
                           "Seconds before rejoining after a crash (blank = global)",
                           self.delay))
+        # Whether this account joins the private server picked on Rejoiner
+        # Setup. Off means it always uses its own game.
+        self.sw_join = self._switch("join_on")
+        pl.addWidget(_row("Send to private server",
+                          "Send this account to the private-server link chosen "
+                          "on Rejoiner Setup (off = always uses its own game)",
+                          self.sw_join))
         self.panel.setVisible(False)
         root.addWidget(self.panel)
 
@@ -955,6 +1540,8 @@ class AccountRow(QFrame):
         extras = []
         if self.acc.get("note"):
             extras.append(self.acc["note"])
+        if self.acc.get("join_on", True) is False:
+            extras.append("own game only")
         if str(self.acc.get("delay", "") or "").strip():
             extras.append(f"{self.acc['delay']}s delay")
         tail = (" · " + ", ".join(extras)) if extras else ""
@@ -996,8 +1583,24 @@ class AccountRow(QFrame):
         self.win.persist()
         self.refresh_sub()
 
+    def _switch(self, cfg_key: str, default: bool = False) -> IOSSwitch:
+        """A per-account override switch, defaulting to the global setting."""
+        sw = IOSSwitch(bool(self.acc.get(cfg_key, default)))
+        sw.toggled.connect(lambda v, k=cfg_key: self._save_flag(k, v))
+        return sw
+
+    def _save_flag(self, key: str, value: bool):
+        self.acc[key] = bool(value)
+        self.win.persist()
+        self.refresh_sub()
+
     def set_monitored_silent(self, v: bool):
         self.sw.setChecked(v, animate=True)
+
+    def refresh_join(self):
+        """Re-read the per-account private-server choice after a change."""
+        self.sw_join.setChecked(bool(self.acc.get("join_on", True)),
+                                animate=False)
 
 
 class AccountsPage(QWidget):
@@ -1163,6 +1766,11 @@ class StatusRow(QFrame):
         colors = {"running": GOOD, "launching": ACCENT, "waiting": WARN,
                   "leaving": WARN, "stopped": MUTED}
         col = colors.get(s, MUTED)
+        # Spells out which server this account is being sent to, so a
+        # private-server link is never a silent decision.
+        target = str(st.get("join_target") or "")
+        if target:
+            self.name.setToolTip(f"{self.name.text()} - {target}")
         self.dot.set_color(col)
         label = {"running": "running", "launching": "launching",
                  "leaving": "leaving", "waiting": "rejoining",
@@ -1328,7 +1936,7 @@ class MonitorPage(QWidget):
 
 # Main application window and page coordinator.
 class MainWindow(QWidget):
-    _join_checked = Signal(bool, str, bool)
+    _join_checked = Signal(str, str, str, str, str)
     _update_checked = Signal(dict)
 
     def __init__(self, display_family: str):
@@ -1363,6 +1971,8 @@ class MainWindow(QWidget):
             except Exception:
                 self.webhook_url = ""
         self._join_checked.connect(self._on_join_checked)
+        self._verified_join = ("", "", "", "")
+        self._picker = None
         self._update_checked.connect(self._on_update_state)
         self._updating = False
         self._pending_restart = False
@@ -1386,7 +1996,7 @@ class MainWindow(QWidget):
         root_layout.setSpacing(0)
 
         items = [("setup", "Rejoiner Setup"), ("accounts", "Manage Accounts"),
-                 ("monitor", "Account Monitor"), ("roblox", "Roblox Settings")]
+                 ("monitor", "Account Monitor"), ("roblox", "Settings")]
         self.nav = TopNavBar(display_family, items)
         self.nav.navigated.connect(self._navigate)
         root_layout.addWidget(self.nav)
@@ -1403,9 +2013,9 @@ class MainWindow(QWidget):
         self.setup_page = SetupPage(self)
         self.accounts_page = AccountsPage(self)
         self.monitor_page = MonitorPage(self)
-        self.roblox_page = RobloxSettingsPage(self)
+        self.settings_page = RobloxSettingsPage(self)
         for p in (self.setup_page, self.accounts_page, self.monitor_page,
-                  self.roblox_page):
+                  self.settings_page):
             self.stack.addPage(p)
         clay.addWidget(self.stack, 1)
         root_layout.addWidget(content, 1)
@@ -1464,7 +2074,7 @@ class MainWindow(QWidget):
                 lambda: self.check_updates(manual=False))
             self._update_timer.start()
         else:
-            self.setup_page.set_update_status({"state": "source"})
+            self.settings_page.set_update_status({"state": "source"})
 
     # Load, save, and update account configuration.
     def _load_accounts(self) -> list[dict]:
@@ -1483,6 +2093,7 @@ class MainWindow(QWidget):
                 "place": a.get("place", ""),
                 "note": a.get("note", ""),
                 "delay": a.get("delay", ""),
+                "join_on": a.get("join_on", True),
             })
         return out
 
@@ -1500,6 +2111,7 @@ class MainWindow(QWidget):
                 "cookie_enc": enc, "alias": a.get("alias", ""),
                 "place": a.get("place", ""), "note": a.get("note", ""),
                 "delay": a.get("delay", ""),
+                "join_on": a.get("join_on", True),
             })
         self.cfg["accounts"] = accs
         self.cfg["selected"] = "all" if self.select_all else list(self.selected_ids)
@@ -1523,6 +2135,7 @@ class MainWindow(QWidget):
             self.select_all = True
         self.persist()
         self.accounts_page.refresh_switches()
+        self._sync_join_page()
         # Apply account-selection changes without restarting the engine.
         if self.engine and self.engine.isRunning():
             if v:
@@ -1540,6 +2153,7 @@ class MainWindow(QWidget):
         self.selected_ids = set() if v else set()
         self.persist()
         self.accounts_page.refresh_switches()
+        self._sync_join_page()
         if self.engine and self.engine.isRunning():
             if v:
                 for a in self.accounts:
@@ -1557,9 +2171,10 @@ class MainWindow(QWidget):
         self.accounts.append({
             "user_id": uid, "username": uname, "cookie": cookie,
             "alias": alias, "place": "", "note": note,
-            "delay": "",
+            "delay": "", "join_on": True,
         })
         self.persist()
+        self._sync_join_page()
         try:
             self._profiles.fetch(uid)
             self._fetch_presence()
@@ -1572,10 +2187,16 @@ class MainWindow(QWidget):
         self.selected_ids.discard(uid)
         self.persist()
         self.accounts_page.rebuild()
+        self._sync_join_page()
 
     def set_setting(self, key: str, value: str):
         self.cfg[key] = value
         save_config(self.cfg)
+        if key in ("joinserver_url", "joinserver_on"):
+            try:
+                self.setup_page.refresh_join_status()
+            except (AttributeError, RuntimeError):
+                pass
 
     def set_default_place(self, value: str):
         value = (parse_place_id(value) or value.strip())
@@ -1642,6 +2263,19 @@ class MainWindow(QWidget):
         self.cfg[cfg_key] = bool(value)
         self.flags[flag] = bool(value)        # shared dict — engine sees it live
         save_config(self.cfg)
+        if flag == "join_server":
+            try:
+                self.setup_page.refresh_join_status()
+            except (AttributeError, RuntimeError):
+                pass
+            if self.engine and self.engine.isRunning():
+                # The link budget is decided when an account is resolved, so a
+                # flip here affects what starts next, not what is running.
+                self.monitor_page.on_log(
+                    "Join specific server turned "
+                    + ("on - newly ticked accounts use the link "
+                       "(Stop and Start to re-apply it to running ones)."
+                       if value else "off - accounts use their own games."))
 
     # Start, stop, and update the multi-account monitoring engine.
     def _selected_accounts(self) -> list[dict]:
@@ -1650,11 +2284,27 @@ class MainWindow(QWidget):
         return [a for a in self.accounts
                 if a["user_id"] in self.selected_ids and a.get("cookie")]
 
+    def _join_link_for(self, a: dict) -> str:
+        """This account's private-server link, or "" when it doesn't use one.
+
+        An account joins the private server when it is ticked on the Rejoiner
+        Setup list or on its own row; everyone else keeps their own game. That
+        is an explicit choice, never a silent fallback from a failed link."""
+        if not self.flags.get("join_server"):
+            return ""
+        if a.get("join_on", True) is False:
+            return ""
+        return str(self.cfg.get("joinserver_url", "") or "").strip()
+
     def _resolve_one(self, a: dict):
+        """One account resolved for the engine.
+
+        The account is sent to the private server only when it was ticked for
+        it; everyone else launches into the game it was set up with."""
         default_place = parse_place_id(self.cfg.get("place", "") or "")
-        join_on = bool(self.flags.get("join_server"))
+        rjoin = self._join_link_for(a)
         pid = parse_place_id(a.get("place")) or default_place
-        if not pid and not join_on:
+        if not pid and not rjoin:
             self.monitor_page.on_log(
                 f"{a['username']} has no place and no default — skipping.")
             return None
@@ -1666,6 +2316,7 @@ class MainWindow(QWidget):
                      if not str(a.get("place") or "").strip() else "")
         return {**a, "rplace": pid or "", "rdelay": d,
                 "runiverse": runiverse,
+                "rjoin": rjoin,
                 "custom_delay": bool(str(a.get("delay") or "").strip())}
 
     def _resolve(self) -> list[dict]:
@@ -1722,7 +2373,7 @@ class MainWindow(QWidget):
         self.engine = MonitorEngine(resolved, self.flags, webhook=self.webhook_url,
                                     join_url=self.cfg.get("joinserver_url", ""),
                                     roblox_exe=self._roblox_exe(),
-                                    icon_path=icon_path)
+                                    app_icon=_app_icon_path())
         self.engine.log.connect(self._log_sink)
         self.engine.state.connect(self._state_sink)
         self.engine.status.connect(self._status_sink)
@@ -1769,7 +2420,11 @@ class MainWindow(QWidget):
 
     def _on_presence(self, mapping: dict):
         for uid, state in mapping.items():
-            row = self.accounts_page._rows.get(int(uid))
+            try:
+                key = int(uid)
+            except (TypeError, ValueError):
+                continue
+            row = self.accounts_page._rows.get(key)
             if row:
                 row.set_presence(state)
 
@@ -1801,42 +2456,93 @@ class MainWindow(QWidget):
         return f"{_fmt_hms(d['runtime'])} farmed · {d['launches']} launches"
 
     # Validate a Roblox share or private-server link.
+    # Validate a Roblox share or private-server link.
     def check_join_link(self, url: str):
+        """Resolve the link and report exactly where it would send accounts."""
         url = (url or "").strip()
         st = self.setup_page.join_status
-        code, ltype = parse_share_link(url)
-        if not code:
-            st.setText("Paste a valid share / private-server link.")
+        parsed = parse_join_link(url)
+        if not parsed:
+            st.setText(
+                "Paste a valid share / private-server link: the link Roblox "
+                "gives you on your private server, "
+                "https://www.roblox.com/share?code=...&type=Server, or "
+                "https://www.roblox.com/games/<id>/<name>"
+                "?privateServerLinkCode=...")
             st.setStyleSheet(f"color:{WARN};")
             return
-        cookie = next((a["cookie"] for a in self.accounts if a.get("cookie")), None)
+        cookie = next((a["cookie"] for a in self.accounts if a.get("cookie")),
+                      None)
         if not cookie:
             st.setText("Add an account first (its cookie resolves the link).")
             st.setStyleSheet(f"color:{WARN};")
             return
         self.set_setting("joinserver_url", url)
-        st.setText("Checking…")
+        st.setText("Checking the link...")
         st.setStyleSheet(f"color:{ACCENT_SOFT};")
 
         def work():
             try:
-                place, inst = resolve_share_link(cookie, code, ltype)
-            except Exception:
-                place, inst = None, None
-            self._join_checked.emit(bool(place), place or "", bool(inst))
+                target = resolve_join_link(cookie, url)
+            except Exception as e:
+                target = JoinTarget(error=f"resolve failed ({e})")
+            self._join_checked.emit(
+                target.kind, target.place or "", target.link_code or "",
+                target.job_id or "", target.error or "")
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_join_checked(self, ok: bool, place: str, specific: bool):
+    # Private-server picker: choose a server the account already owns.
+    def open_private_server_picker(self):
+        """Open the private-server browser for a chosen account."""
+        if not any(a.get("cookie") for a in self.accounts):
+            self.setup_page.join_status.setText(
+                "Add an account first - the private servers it owns are listed.")
+            self.setup_page.join_status.setStyleSheet(f"color:{WARN};")
+            return
+        if self._picker is None:
+            self._picker = PrivateServerDialog(self)
+        self._picker.show()
+        self._picker.raise_()
+        self._picker.load()
+
+    def apply_join_link(self, link: str, label: str = ""):
+        """Fill the join link in from the private-server picker."""
+        link = (link or "").strip()
+        if not link:
+            return
+        self.set_setting("joinserver_url", link)
+        self.setup_page.join_edit.setText(link)
+        self._navigate(0)
         st = self.setup_page.join_status
-        if ok:
-            st.setText(f"\u2713 place {place}"
-                       + (" \u00b7 specific server" if specific
-                          else " \u00b7 open server"))
-            st.setStyleSheet(f"color:{GOOD};")
-        else:
-            st.setText("Couldn't resolve that link.")
+        where = f" ({label})" if label else ""
+        st.setText(f"Using {where or 'that private server'}: {link} - press "
+                   f"Check link to confirm it resolves.")
+        st.setStyleSheet(f"color:{GOOD};")
+
+    def _on_join_checked(self, kind: str, place: str, link_code: str,
+                         job: str, error: str):
+        st = self.setup_page.join_status
+        if error:
+            st.setText(f"That link did not resolve: {error}. Accounts wait "
+                       f"instead of being sent to a public server.")
             st.setStyleSheet(f"color:{BAD};")
+            return
+        if kind == "private":
+            what = ("private server - place " + place
+                    + (f" - server {job[:12]}..." if job else ""))
+        elif kind == "job":
+            what = f"one specific server - place {place} - server {job[:12]}..."
+        else:
+            what = f"that game - place {place} (Roblox picks any server)"
+        chosen = [a for a in self.accounts
+                  if a.get("cookie") and a.get("join_on", True) is not False]
+        names = ", ".join(a.get("alias") or a.get("username", "?")
+                          for a in chosen[:6])
+        more = "" if len(chosen) <= 6 else f" (+{len(chosen) - 6} more)"
+        st.setText(f"Send {names or 'no account'}{more} to {what}.")
+        st.setStyleSheet(f"color:{GOOD};")
+        self._verified_join = (kind, place, link_code, job)
 
     # Forward engine updates to the UI and optional bot bridge.
     def _log_sink(self, msg: str):
@@ -1893,13 +2599,13 @@ class MainWindow(QWidget):
         found. Emits state through _update_checked for the Setup page."""
         target = updater.exe_path()
         if not target:
-            self.setup_page.set_update_status({"state": "source"})
+            self.settings_page.set_update_status({"state": "source"})
             return
         if self._updating:
             return
         self._updating = True
         if manual:
-            self.setup_page.set_update_status({"state": "checking"})
+            self.settings_page.set_update_status({"state": "checking"})
 
         def work():
             final: dict = {}
@@ -1938,7 +2644,7 @@ class MainWindow(QWidget):
         threading.Thread(target=work, daemon=True).start()
 
     def _on_update_state(self, info: dict):
-        self.setup_page.set_update_status(info)
+        self.settings_page.set_update_status(info)
         if info.get("state") != "ready":
             return
         # Apply automatically: restart now when idle, otherwise right after
@@ -2025,6 +2731,72 @@ class MainWindow(QWidget):
         self.cfg["joinserver_url"] = url
         self.setup_page.join_edit.setText(url)
         save_config(self.cfg)
+        try:
+            self.setup_page.refresh_join_status()
+        except (AttributeError, RuntimeError):
+            pass
+
+    def _sync_join_page(self):
+        """Refresh the Setup page's private-server list and summary.
+
+        Safe to call even before the page finishes building, which is what
+        makes it usable from account add/remove/toggle handlers."""
+        try:
+            self.setup_page.refresh_join_accounts()
+            self.setup_page.refresh_join_status()
+        except (AttributeError, RuntimeError):
+            pass
+
+    def set_account_join(self, uid, on: bool):
+        """Choose whether one account joins the private server.
+
+        The Setup page list and the account's own row both read this, so they
+        can never disagree about where an account is being sent."""
+        a = next((x for x in self.accounts if x["user_id"] == uid), None)
+        if not a:
+            return
+        a["join_on"] = bool(on)
+        self.persist()
+        row = self.accounts_page._rows.get(uid)
+        if row is not None:
+            row.sw_join.setChecked(bool(on), animate=False)
+        self.accounts_page.refresh_stats()
+        try:
+            self.setup_page.refresh_join_row(uid)
+        except (AttributeError, RuntimeError):
+            pass
+        self._sync_join_page()
+
+    def bridge_set_account_join(self, uid, on: bool):
+        """Set or clear the private-server choice for one account."""
+        self.set_account_join(uid, on)
+
+    def bridge_set_join_accounts(self, names: list[str], on: bool,
+                                 clear_others: bool = False) -> int:
+        """Apply one private-server choice to several accounts at once.
+
+        Naming accounts turns them on (or off) and leaves the rest alone;
+        `clear_others` is for "everyone" / "the first N", where the accounts
+        not named must be switched the other way too."""
+        wanted = {n.strip().lower() for n in names if n.strip()}
+        if not wanted:
+            return 0
+        changed = 0
+        for a in self.accounts:
+            hit = (a.get("username") or "").lower() in wanted
+            if on:
+                value = True if hit else (False if clear_others else None)
+            else:
+                value = False if hit else None
+            if value is None:
+                continue
+            if bool(a.get("join_on", True)) != value:
+                a["join_on"] = value
+                changed += 1
+        self.persist()
+        self.accounts_page.rebuild()
+        self._sync_join_page()
+        return changed
 
     def bridge_watch(self, on: bool):
         running = bool(self.engine and self.engine.isRunning())
@@ -2065,6 +2837,12 @@ class MainWindow(QWidget):
             pass
         self.persist()
         super().closeEvent(ev)
+
+
+def _app_icon_path() -> str:
+    """Path to the app's own icon - the badge embeds are branded with."""
+    path = _resource("rejoiner_logo.png")
+    return path if os.path.exists(path) else ""
 
 
 def _resource(name: str) -> str:

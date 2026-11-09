@@ -149,6 +149,13 @@ def build_stylesheet(text_family: str) -> str:
     /* Settings cards and inset panels. */
     QFrame#Card      {{ background: {CARD}; border-radius: 5px;
                         border: 1px solid {BORDER}; }}
+
+    /* Dropdown popups read as menus, not as another card on the page. */
+    QFrame#DropdownPopup {{ background: {CARD}; border: 1px solid {BORDER2};
+                            border-radius: 6px; }}
+    /* Menu rows light up under the cursor, so they read as clickable. */
+    QFrame#DropdownRow {{ background: transparent; border-radius: 4px; }}
+    QFrame#DropdownRow:hover {{ background: {CARD2}; }}
     QFrame#Inset     {{ background: {CARD2}; border-radius: 5px;
                         border: 1px solid {BORDER}; }}
 

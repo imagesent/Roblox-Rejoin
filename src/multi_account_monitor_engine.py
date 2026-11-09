@@ -7,7 +7,7 @@ from an instance, then rejoins each affected account independently:
 
 - client process exited (crash, forced close, Roblox update restart)
 - native kick/disconnect dialog open on the client ("Disconnected",
-  "Error Code: 267", moderation messages — the code is read from the
+  "Error Code: 267", moderation messages - the code is read from the
   dialog and reported)
 - client window hung (frozen, not pumping messages)
 - client open but Roblox presence says the account left the game
@@ -15,8 +15,14 @@ from an instance, then rejoins each affected account independently:
 - presence unreachable for a sustained period (connection loss)
 - client never reaches the game (stuck on the loading screen)
 - account landed in a different experience than configured
-- account landed in a different server than the requested private
-  server (join-link verification)
+- account landed in a different server than the private server or
+  specific server its link points at
+
+Private servers are resolved per account: each account may carry its own
+share / private-server link, and only the accounts the user chose to send
+there actually use one. A link that Roblox refuses to resolve holds the
+account back with a clear reason instead of quietly dropping it into public
+matchmaking.
 
 The UI can update the shared behavior flags while monitoring. Changing
 which accounts are selected restarts the engine in the UI.
@@ -35,13 +41,15 @@ from rejoiner_constants import (LAUNCH_STAGGER, PRESENCE_SETTLE, KICK_GRACE,
                       KICK_POLL, LEAVE_POLL, LEAVE_MAX_WAIT, PRESENCE_INTERVAL,
                       PRESENCE_FAIL_LIMIT, PRESENCE_FAIL_TIME, HANG_GRACE,
                       STUCK_CONNECT_GRACE, JOIN_VERIFY_GRACE, JOIN_VERIFY_MAX,
-                      AUTH_FAIL_LIMIT, LONG_BACKOFF)
+                      AUTH_FAIL_LIMIT, LONG_BACKOFF, JOIN_RESOLVE_ATTEMPTS,
+                      JOIN_RETRY_SECS, JOIN_RESOLVE_GIVEUP,
+                      SERVER_REPROBE_SECS)
 from roblox_windows import (roblox_pids, kill_pid, kill_all_roblox,
                             scan_client_states)
 from account_storage import write_session_map, release_multi_instance
 from roblox_api import (get_auth_ticket, build_launch_uri, presence_detail,
-                        parse_share_link, resolve_share_link,
-                        universe_id_for_place, fetch_game_icons,
+                        resolve_join_link, probe_join_server,
+                        universe_id_for_place,
                         latest_client_error)
 import roblox_error_codes as error_codes
 import discord_notifications as dn
@@ -59,18 +67,16 @@ class MonitorEngine(QThread):
 
     def __init__(self, accounts: list[dict], flags: dict,
                  webhook: str = "", join_url: str = "",
-                 roblox_exe: str = "", icon_path: str = "", parent=None):
+                 roblox_exe: str = "", app_icon: str = "", parent=None):
         super().__init__(parent)
         self.accounts = accounts          # resolved: rplace/rdelay present
         self.flags = flags                # live: kick detection and launch behavior
         self.webhook = webhook or ""
         self.join_url = (join_url or "").strip()
-        self.roblox_exe = (roblox_exe or "").strip()   # "" → use protocol handler
-        self.icon_path = (icon_path or "").strip()     # game icon for embeds
+        self.roblox_exe = (roblox_exe or "").strip()   # "" -> use protocol handler
+        self.app_icon = (app_icon or "").strip()       # the app's own badge
         self._icon_bytes: bytes | None = None
         self._icon_loaded = False
-        self._join_place = None
-        self._join_instance = None
         self._running = 0
         self._total = 0
         self._last_status = ""
@@ -84,7 +90,16 @@ class MonitorEngine(QThread):
         self._universe_cache: dict[str, str | None] = {}
         self._last_collision_check = 0.0
         self._mutex_handles = []
+        # Private-server / specific-server targets, resolved per link text so
+        # two accounts sharing one link only hit Roblox once. Accounts whose
+        # link is not resolved yet wait in `pending` instead of launching.
+        self._targets: dict[int, dict] = {}
+        self._links: dict[str, dict] = {}
+        self._link_gids: dict[str, dict[str, int]] = {}
+        self._pending: dict[int, dict] = {}
+        self._rt_counts_cache: dict = {}
 
+    # Presence and universe-id helpers.
     def _universe_for_place(self, place_id: str | None) -> str | None:
         if not place_id:
             return None
@@ -120,11 +135,11 @@ class MonitorEngine(QThread):
         self._kill_q.put(uid)
 
     def add_account(self, acc: dict):
-        """Live-add a (resolved) account while running — it launches at once."""
+        """Live-add a (resolved) account while running - it launches at once."""
         self._add_q.put(acc)
 
     def drop_account(self, uid: int, kill: bool = False):
-        """Live-remove an account while running — stop watching it."""
+        """Live-remove an account while running - stop watching it."""
         self._drop_q.put((int(uid), bool(kill)))
 
     def _status_text(self, rt: dict) -> str:
@@ -143,10 +158,10 @@ class MonitorEngine(QThread):
             parts.append(f"{rejoining} rejoining")
         if stopped:
             parts.append(f"{stopped} stopped")
-        return "  ·  ".join(parts)
+        return "  -  ".join(parts)
 
     # ------------------------------------------------------------------
-    # Discord notifications — clean embeds in the Weeby style: plain title,
+    # Discord notifications - clean embeds in the Weeby style: plain title,
     # bold "Label: value" lines, game icon thumbnail, no emojis.
     # ------------------------------------------------------------------
     def _counts(self, rt: dict) -> tuple[int, int]:
@@ -155,25 +170,16 @@ class MonitorEngine(QThread):
         return up, total
 
     def _load_icon(self) -> None:
-        """Load the selected game's icon once (local cache first, then the
-        Roblox thumbnail API) so every embed can show it as a thumbnail."""
+        """Load the app's own icon once, so every embed is branded with the
+        tool it came from rather than a game thumbnail."""
         if self._icon_loaded:
             return
         self._icon_loaded = True
         data = b""
         try:
-            if self.icon_path and os.path.exists(self.icon_path):
-                with open(self.icon_path, "rb") as f:
+            if self.app_icon and os.path.exists(self.app_icon):
+                with open(self.app_icon, "rb") as f:
                     data = f.read()
-            if not data:
-                place = (self._join_place
-                         or next((str(a.get("rplace") or "")
-                                  for a in self.accounts
-                                  if a.get("rplace")), ""))
-                universe = self._universe_for_place(place) if place else None
-                if universe:
-                    icons = fetch_game_icons([universe])
-                    data = icons.get(universe, b"")
         except Exception:
             data = b""
         self._icon_bytes = data or None
@@ -218,6 +224,277 @@ class MonitorEngine(QThread):
             details.append(("Server", str(st["server"])[:18]))
         return details
 
+    # ------------------------------------------------------------------
+    # Private-server / specific-server targets.
+    #
+    # Each account may carry its own link (`rjoin`), which is either a
+    # per-account override or the link the Setup page sends this way. A link
+    # only becomes a target once Roblox resolves it; a link that keeps
+    # failing holds the account in "waiting" with the reason shown, so a bad
+    # link can never silently dump an account into public matchmaking.
+    # ------------------------------------------------------------------
+    def _resolve_join(self, acc: dict, now: float, force: bool = False
+                      ) -> dict | None:
+        """Resolve (with retries) this account's link. None = still unknown."""
+        link = str(acc.get("rjoin") or "").strip()
+        uid = acc.get("user_id")
+        if not (self.flags.get("join_server") and link):
+            self._targets.pop(uid, None)
+            return None
+        state = self._links.get(link)
+        if state is not None:
+            target = state.get("target")
+            if target is not None:
+                self._targets[uid] = state
+                return state
+            if not force and (target is None and state.get("tries")
+                              >= JOIN_RESOLVE_GIVEUP):
+                return None                # hopeless link - leave it stopped
+        if state is None:
+            state = {"link": link, "target": None, "tries": 0,
+                     "next_at": now, "error": "", "gave_up": False,
+                     "ref": "", "ref_at": now}
+            self._links[link] = state
+        if not force and now < state.get("next_at", 0.0):
+            return None
+        cookie = acc.get("cookie")
+        if not cookie:
+            state["error"] = "no account cookie to resolve the link with"
+            state["tries"] = state.get("tries", 0) + 1
+            state["next_at"] = now + JOIN_RETRY_SECS
+            return None
+        target = resolve_join_link(cookie, link, attempts=JOIN_RESOLVE_ATTEMPTS,
+                                   stop=self.stop_event.is_set)
+        state["tries"] = state.get("tries", 0) + 1
+        if target.ok:
+            state["target"] = target
+            state["error"] = ""
+            state["gave_up"] = False
+            state["ref"] = ""
+            # Ask Roblox which server this link points at, so a client that
+            # silently lands in public matchmaking can be caught and rejoin
+            # instead of being declared correct.
+            if target.kind == "private":
+                job, _status, _err = probe_join_server(
+                    cookie, target.place, link_code=target.link_code)
+                if job:
+                    state["ref"] = job
+                    target.job_id = job
+            elif target.kind == "job" and target.job_id:
+                state["ref"] = target.job_id
+            state["ref_at"] = now
+            self._apply_target(acc, target)
+            self._targets[uid] = state
+            self._pending.pop(uid, None)
+            self.log.emit(f"Join link: {acc.get('username', '?')} -> "
+                          f"{target.describe()}.")
+            return state
+        state["error"] = target.error or "couldn't resolve that link"
+        state["gave_up"] = state["tries"] >= JOIN_RESOLVE_GIVEUP
+        state["next_at"] = now + JOIN_RETRY_SECS
+        return None
+
+    def _join_target_summary(self) -> str:
+        """One phrase describing where the resolved targets send accounts.
+
+        Used by the startup notification, so it says "private server links"
+        rather than listing every account."""
+        kinds = {s["target"].kind for s in self._targets.values()
+                 if s.get("target") is not None}
+        if not kinds:
+            return ""
+        if kinds == {"private"}:
+            return "private server links"
+        if kinds == {"job"}:
+            return "specific server links"
+        if kinds == {"open"}:
+            return "one shared game"
+        return "a mix of server links"
+
+    @staticmethod
+    def _current_place(places: set, root_place: str | None) -> str:
+        """The place an account is really in.
+
+        Presence reports both the current place and the experience's root
+        place; when they differ, the account has been moved to another place
+        inside the same experience."""
+        root = str(root_place or "")
+        others = {str(p) for p in places if str(p) != root}
+        if len(others) == 1:
+            return others.pop()
+        return root or (str(next(iter(places))) if places else "")
+
+    def _in_target_place(self, acc: dict, target, places: set,
+                         root_place: str | None) -> bool:
+        """True when the account is in the place its link points at.
+
+        Anywhere else inside the same experience (a lobby handing players to
+        the map, a reserved server the game opened for them) is a teleport,
+        not a wrong join, so the job id is simply not comparable."""
+        if target is None:
+            return False
+        where = self._current_place(places, root_place)
+        if not where:
+            return False
+        return where == str(target.place) or where == str(acc.get("rplace") or "")
+
+    def _server_moved(self, acc: dict, target, key: str, gid: str,
+                      ref: str, backers: int, now: float) -> bool:
+        """True when the account is in the private server after all.
+
+        A private server gets a fresh job id whenever Roblox restarts it, and
+        a single account cannot out-vote a stale lookup, so the link is asked
+        again (at most once a minute) before the client is closed."""
+        state = self._links.get(key) or {}
+        if backers >= 2:
+            # Several accounts agree on where they are: believe them.
+            return False
+        if str(state.get("ref") or "") != str(ref):
+            return False                     # the vote produced this reference
+        if now - float(state.get("ref_at", 0.0)) < SERVER_REPROBE_SECS:
+            return False
+        state["ref_at"] = now
+        try:
+            job, _status, _err = probe_join_server(
+                acc.get("cookie"), target.place, link_code=target.link_code,
+                job_id=target.job_id)
+        except Exception:
+            job = None
+        if job and job == gid:
+            # The private server just has a new job id: adopt it.
+            state["ref"] = job
+            self.log.emit(
+                f"Server check: {acc.get('username', '?')} is in the private "
+                f"server (it restarted with a new job) - keeping it.")
+            return True
+        if job:
+            state["ref"] = job
+        return False
+
+    def _wrong_server_tick(self, acc: dict, st: dict, target, now: float
+                          ) -> bool:
+        """One wrong-server poll. Returns True once checking should stop.
+
+        A mismatch must persist before the client is closed, and only a few
+        attempts are made per launch, so a game that shuffles servers can
+        never be rejoined forever."""
+        if st.get("wrong_server_since") is None:
+            st["wrong_server_since"] = now
+            return False
+        if now - st["wrong_server_since"] < JOIN_VERIFY_GRACE:
+            return False
+        if st.get("wrong_server_tries", 0) >= JOIN_VERIFY_MAX:
+            st["server_check_done"] = True
+            st["wrong_server_since"] = None
+            self.log.emit(
+                f"Server check: {acc.get('username', '?')} stopped verifying "
+                f"{target.label()} after {st['wrong_server_tries']} tries - "
+                f"leaving it where Roblox put it.")
+            return True
+        st["wrong_server_tries"] = st.get("wrong_server_tries", 0) + 1
+        self._remove_from_game(
+            st, now,
+            f"landed in a different server than {target.label()} "
+            f"(try {st['wrong_server_tries']}/{JOIN_VERIFY_MAX})")
+        self.log.emit(
+            f"Wrong server: {acc.get('username', '?')} - landed in a "
+            f"different server than {target.label()} "
+            f"(try {st['wrong_server_tries']}/{JOIN_VERIFY_MAX}); rejoining "
+            f"once it leaves.")
+        self._notify(
+            "warn", acc.get("username", "?"), event="Wrong server",
+            details=self._account_details(st) + [
+                ("Reason", f"not in the private server ({target.label()})"),
+                ("Attempt", f"{st['wrong_server_tries']}/{JOIN_VERIFY_MAX}")],
+            footer="Rejoining the private server")
+        return False
+
+    def _apply_target(self, acc: dict, target) -> None:
+        """Point this account at a resolved join target. Its place identity
+        comes from the link so wrong-game detection follows the server the
+        account is really being sent to."""
+        acc["rplace"] = target.place
+        if target.universe:
+            acc["runiverse"] = target.universe
+        else:
+            acc["runiverse"] = self._universe_for_place(target.place) or ""
+        acc["rjoin_target"] = target.label()
+
+    def _retry_join(self, acc: dict, st: dict, now: float) -> bool:
+        """Retry a pending link. True when the account may now launch."""
+        state = self._resolve_join(acc, now)
+        if state is None:
+            info = self._links.get(str(acc.get("rjoin") or "").strip()) or {}
+            if info.get("gave_up"):
+                reason = f"giving up on the join link ({info.get('error')})"
+                st["state"] = "stopped"
+            else:
+                reason = (info.get("error")
+                          or "join link not resolved yet - retrying")
+                st["state"] = "waiting"
+                st["rejoin_at"] = now + JOIN_RETRY_SECS
+            st["next_join_try"] = now + JOIN_RETRY_SECS
+            self._set_reason(st, reason)
+            if reason.startswith("giving up"):
+                self.log.emit(f"Join link: {acc.get('username', '?')} - "
+                             f"{reason}. Fix the link, then re-tick the account.")
+            return False
+        st["state"] = "launching"
+        self._enqueue(acc.get("user_id"), acc)
+        return True
+
+    def _note_server(self, key: str, uid, gid, now: float) -> None:
+        """Record which server one account is in, per link.
+
+        One entry per *account*, not per poll: a vote is only meaningful when
+        different accounts agree, otherwise a single account in the wrong
+        server would count its own repeated answers as a majority."""
+        if not key or not gid or gid == "None" or uid is None:
+            return
+        seen = self._link_gids.setdefault(key, {})
+        slot = seen.get(uid)
+        if slot is None or slot.get("gid") != str(gid):
+            seen[uid] = {"gid": str(gid), "first": now}
+
+    def _server_reference(self, key: str) -> tuple[str | None, int]:
+        """The server an account is expected to be in, and how sure we are.
+
+        Two sources of truth: what Roblox said the link points at when it was
+        resolved, and where the accounts themselves ended up. A server that
+        two or more accounts agree on wins, because a private server's job id
+        changes whenever Roblox restarts it - otherwise a stale lookup would
+        rejoin a working client forever. The count is of *accounts*, so one
+        account's own reports can never out-vote the link."""
+        if not key:
+            return None, 0
+        state = self._links.get(key) or {}
+        probe = str(state.get("ref") or "")
+        per_account = self._link_gids.get(key) or {}
+        tally: dict[str, dict] = {}
+        for info in per_account.values():
+            gid = str(info.get("gid") or "")
+            if not gid:
+                continue
+            slot = tally.setdefault(gid, {"count": 0, "first": info.get("first", 0.0)})
+            slot["count"] += 1
+            slot["first"] = min(slot["first"], info.get("first", 0.0))
+        vote = None
+        vote_n = 0
+        if tally:
+            (vote, info) = max(tally.items(),
+                               key=lambda kv: (kv[1]["count"], -kv[1]["first"]))
+            vote_n = int(info["count"])
+        if vote_n >= 2 and vote != probe:
+            return vote, vote_n
+        if probe:
+            return probe, 1
+        if vote:
+            return vote, vote_n
+        return None, 0
+
+    def _clear_reference(self, key: str) -> None:
+        self._link_gids.pop(key, None)
+
     # Launch queue processing and client startup.
     def _launch_one(self, acc: dict):
         ticket = get_auth_ticket(acc["cookie"])
@@ -227,12 +504,22 @@ class MonitorEngine(QThread):
         if not btid:
             btid = random.randint(100_000_000_000, 999_999_999_999)
             acc["_btid"] = btid
-        if self.flags.get("join_server") and self._join_place:
-            place, inst = self._join_place, self._join_instance
+        state = self._targets.get(acc.get("user_id"))
+        target = state.get("target") if state else None
+        if target is not None:
+            place = target.place
+            inst = target.job_id
+            link_code = target.link_code
         else:
-            place, inst = str(acc["rplace"]), None
+            place, inst, link_code = str(acc["rplace"]), None, None
+        if not place:
+            return None, "no place to launch (set one on Rejoiner Setup)"
+        uri = build_launch_uri(ticket, place, inst, link_code,
+                               browser_tracker_id=btid)
+        if not uri:
+            return None, ("invalid launch target (place id or link code has "
+                          "unsupported characters)")
         before = roblox_pids()
-        uri = build_launch_uri(ticket, place, inst, browser_tracker_id=btid)
         try:
             if self.roblox_exe and os.path.exists(self.roblox_exe):
                 import subprocess
@@ -288,6 +575,9 @@ class MonitorEngine(QThread):
                 "hung_since": None,
                 "dialog_reported": False, "hung_reported": False,
                 "wrong_server_since": None, "wrong_server_tries": 0,
+                "next_join_try": 0.0,
+                "server_check_done": False,
+                "server_verified": False,
                 "staged_reason": None}
 
     @staticmethod
@@ -305,6 +595,8 @@ class MonitorEngine(QThread):
         st["pres_fail_since"] = None
         st["hung_since"] = None
         st["wrong_server_since"] = None
+        st["server_check_done"] = False
+        st["server_verified"] = False
         st["server"] = None
         st["dialog_reported"] = False
         st["hung_reported"] = False
@@ -333,6 +625,7 @@ class MonitorEngine(QThread):
                 "custom_delay": bool(acc.get("custom_delay")),
                 "rejoin_in": rejoin_in,
                 "reason": st.get("last_reason") or "",
+                "join_target": acc.get("rjoin_target") or "",
             })
         self._rt_counts_cache = rt
         self.state.emit(rows)
@@ -355,14 +648,14 @@ class MonitorEngine(QThread):
         confirms it is no longer in-game. Roblox keeps a just-closed session
         'in-game' for a while; relaunching before that clears causes error
         264. A time cap applies ONLY to repeated lookup failures so a dead
-        cookie can't hang the account forever — and an absolute safety cap
+        cookie can't hang the account forever - and an absolute safety cap
         prevents a stale 'in-game' report from blocking a rejoin for good."""
         if st.get("pid") and st["pid"] in pids:
             return False                          # client process still alive
         started = st.get("leave_started") or now
         ck = st["acc"].get("cookie")
         if not ck:
-            return True                           # can't verify — don't block
+            return True                           # can't verify - don't block
         if now < st.get("next_leave_check", 0.0):
             return False                          # throttle presence polling
         st["next_leave_check"] = now + LEAVE_POLL
@@ -372,8 +665,8 @@ class MonitorEngine(QThread):
             # Repeated lookup errors: give up waiting after the cap.
             return now - started >= LEAVE_MAX_WAIT
         if state != "ingame":
-            return True                           # confirmed left → safe to rejoin
-        # Presence still says in-game long after the process died — treat the
+            return True                           # confirmed left -> safe to rejoin
+        # Presence still says in-game long after the process died - treat the
         # report as stale rather than blocking the rejoin indefinitely.
         return now - started >= LEAVE_MAX_WAIT * 3
 
@@ -383,7 +676,7 @@ class MonitorEngine(QThread):
     def _remove_from_game(self, st: dict, now: float, reason: str,
                           count_disconnect: bool = True,
                           delay=None) -> None:
-        """Kill the client (if open) and start the leave→rejoin cycle for an
+        """Kill the client (if open) and start the leave->rejoin cycle for an
         unplanned removal. Shared by crash/kick/hang/presence paths."""
         if count_disconnect:
             st["disconnects"] += 1
@@ -401,10 +694,11 @@ class MonitorEngine(QThread):
         """Different-servers mode: Roblox can silently matchmake two accounts
         into the SAME server. Ask presence which server (gameId) each running
         account is actually in; if any server holds 2+ accounts, keep the
-        alphabetically first and relaunch the rest to re-spread them."""
+        first and relaunch the rest to re-spread them.
+
+        Accounts sent to a specific server are exempt - they are *supposed*
+        to share one, and their link target is checked instead."""
         if not self.flags.get("diff_server"):
-            return
-        if self.flags.get("join_server"):
             return
         if not self.flags.get("auto_relaunch", True):
             return
@@ -414,7 +708,8 @@ class MonitorEngine(QThread):
                    if st["state"] == "running" and st.get("pid")
                    and st.get("open_since")
                    and now - st["open_since"] >= PRESENCE_SETTLE
-                   and st["acc"].get("cookie")]
+                   and st["acc"].get("cookie")
+                   and uid not in self._targets]
         if len(running) < 2:
             return
         self._last_collision_check = now
@@ -437,7 +732,7 @@ class MonitorEngine(QThread):
             keep = ordered[0]
             for uid in ordered[1:]:
                 st = rt[uid]
-                reason = f"shared server with {rt[keep]['acc']['username']} — moving it"
+                reason = f"shared server with {rt[keep]['acc']['username']} - moving it"
                 self._remove_from_game(st, now, reason, count_disconnect=False,
                                        delay=3)
                 self.log.emit(f"Server move: {st['acc']['username']} {reason}.")
@@ -449,6 +744,27 @@ class MonitorEngine(QThread):
 
     # Poll account processes and handle queued UI actions.
     def run(self):
+        # A crash in here must say why: a silent QThread death leaves the app
+        # looking like it did nothing, which is the worst possible feedback.
+        try:
+            self._run_inner()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                self.log.emit(f"Monitor crashed: {type(e).__name__}: {e} - "
+                              "stopping. Press Start to try again.")
+                self.status.emit(f"Stopped ({type(e).__name__})", False)
+            except Exception:
+                pass
+            try:
+                release_multi_instance(self._mutex_handles)
+                self._mutex_handles = []
+            except Exception:
+                pass
+            return
+
+    def _run_inner(self):
         from account_storage import acquire_multi_instance
         try:
             self._mutex_handles = acquire_multi_instance()
@@ -456,7 +772,7 @@ class MonitorEngine(QThread):
             self._mutex_handles = []
         if self._mutex_handles:
             self.log.emit("Multi-instance: holding Roblox singleton mutex "
-                          "and event — parallel clients can launch.")
+                          "and event - parallel clients can launch.")
 
         self._started_at = time.time()
         self._rt_counts_cache = {}
@@ -464,62 +780,56 @@ class MonitorEngine(QThread):
         launcher.start()
 
         rt: dict[int, dict] = {}
-        self._join_place = None
-        self._join_instance = None
-        if self.flags.get("join_server") and self.join_url:
-            code, ltype = parse_share_link(self.join_url)
-            cookie = next((a.get("cookie") for a in self.accounts
-                           if a.get("cookie")), None)
-            if code and cookie:
-                place = inst = None
-                # Retry resolution: transient API/CSRF failures shouldn't
-                # silently dump every account into open matchmaking.
-                for attempt in range(3):
-                    place, inst = resolve_share_link(cookie, code, ltype)
-                    if place or self.stop_event.is_set():
-                        break
-                    self.stop_event.wait(3)
-                if place:
-                    self._join_place, self._join_instance = place, inst
-                    join_universe = universe_id_for_place(place) or ""
-                    for a in self.accounts:
-                        a["rplace"] = place        # kick-detect targets this game
-                        a["runiverse"] = join_universe
-                    self.log.emit("Join server: resolved place " + place
-                                  + (" (specific server)." if inst
-                                     else " (open server)."))
-                else:
-                    self.log.emit("Join server: couldn't resolve that link "
-                                  "after 3 attempts — launching into each "
-                                  "account's own game.")
-            else:
-                self.log.emit("Join server: missing link or cookie — launching "
-                              "normally.")
-        adopt_pids: list[int] = []
+            # Resolve every account's join link first, one link at a time, so a
+        # transient API failure never decides an account's destination.
+        now0 = time.time()
+        for acc in self.accounts:
+            uid = acc.get("user_id")
+            st = self._new_state(acc)
+            rt[uid] = st
+            if self.flags.get("join_server") and str(acc.get("rjoin") or "").strip():
+                state = self._resolve_join(acc, now0, force=True)
+                if state is None:
+                    st["state"] = "waiting"
+                    st["next_join_try"] = now0 + JOIN_RETRY_SECS
+                    st["rejoin_at"] = st["next_join_try"]
+                    link = str(acc.get("rjoin") or "").strip()
+                    info = self._links.get(link) or {}
+                    self._set_reason(st, info.get("error")
+                                     or "join link not resolved yet - retrying")
+                    self._pending[uid] = st
+                    self.log.emit(f"Join link: {acc.get('username', '?')} -> "
+                                  f"{st['last_reason']}.")
+                    continue
+            # _resolve_join has already pointed the account at the target.
+            # Only accounts without a pending link launch; adopted clients fill in
+        # below so the pid order still matches the account order.
         if self.flags.get("detect_open"):
             adopt_pids = sorted(roblox_pids())
             if adopt_pids:
                 self.log.emit(f"Detect open clients: found {len(adopt_pids)} "
-                              f"open Roblox client(s) — adopting them.")
+                              f"open Roblox client(s) - adopting them.")
             else:
-                self.log.emit("Detect open clients: none open — launching "
+                self.log.emit("Detect open clients: none open - launching "
                               "normally.")
+        else:
+            adopt_pids = []
         self._load_icon()
-        now0 = time.time()
         for idx, acc in enumerate(self.accounts):
-            uid = acc["user_id"]
-            st = self._new_state(acc)
+            uid = acc.get("user_id")
+            st = rt[uid]
+            if uid in self._pending:
+                continue
             if self.flags.get("detect_open") and idx < len(adopt_pids):
                 st["state"] = "running"
                 st["pid"] = adopt_pids[idx]
                 st["open_since"] = now0
                 st["has_connected"] = True
-                rt[uid] = st
                 self.log.emit(f"Watching {acc['username']} on existing client "
                               f"(pid {adopt_pids[idx]}).")
             else:
-                rt[uid] = st
-                self.log.emit(f"{acc['username']} — launching…")
+                st["state"] = "launching"
+                self.log.emit(f"{acc['username']} - launching...")
                 self._enqueue(uid, acc)
 
         self.status.emit(self._status_text(rt), True)
@@ -527,15 +837,12 @@ class MonitorEngine(QThread):
         _entries = []
         for s in rt.values():
             acc = s["acc"]
-            target = (f"server {self._join_instance[:12]}"
-                      if self._join_instance
-                      else f"place {acc.get('rplace', '?')}")
-            _entries.append((acc.get("username", "?"), target))
+            _entries.append((acc.get("username", "?"),
+                             acc.get("rjoin_target")
+                             or f"place {acc.get('rplace', '?')}"))
         _mode = ("watching" if self.flags.get("auto_relaunch", True)
                  else "launch-only (no auto-relaunch)")
-        where = ("a specific server" if self._join_instance
-                 else f"place {self._join_place}" if self._join_place
-                 else "their own games")
+        where = self._join_target_summary() or "their own games"
         self._notify("info", "Monitoring started",
                      details=[("Mode", _mode), ("Target", where)],
                      description=dn.account_lines(_entries))
@@ -559,8 +866,28 @@ class MonitorEngine(QThread):
                     auid = acc["user_id"]
                     if auid in rt:
                         continue
-                    rt[auid] = self._new_state(acc)
-                    self.log.emit(f"{acc['username']} toggled on — launching…")
+                    st = self._new_state(acc)
+                    if (self.flags.get("join_server")
+                            and str(acc.get("rjoin") or "").strip()):
+                        state = self._resolve_join(acc, now, force=True)
+                        if state is None:
+                            self._pending[auid] = st
+                            st["state"] = "waiting"
+                            st["next_join_try"] = now + JOIN_RETRY_SECS
+                            st["rejoin_at"] = st["next_join_try"]
+                            link = str(acc.get("rjoin") or "").strip()
+                            info = self._links.get(link) or {}
+                            self._set_reason(
+                                st, info.get("error")
+                                or "join link not resolved yet - retrying")
+                            rt[auid] = st
+                            self.log.emit(
+                                f"Join link: {acc['username']} -> "
+                                f"{st['last_reason']}.")
+                            continue
+                    # _resolve_join already applied this account's target.
+                    rt[auid] = st
+                    self.log.emit(f"{acc['username']} toggled on - launching...")
                     self._enqueue(auid, acc)
             except queue.Empty:
                 pass
@@ -572,10 +899,24 @@ class MonitorEngine(QThread):
                         if kill and st.get("pid"):
                             kill_pid(st["pid"])
                         self._launching.discard(duid)
-                        self.log.emit(f"{st['acc']['username']} toggled off — "
+                        self._targets.pop(duid, None)
+                        self._pending.pop(duid, None)
+                        self.log.emit(f"{st['acc']['username']} toggled off - "
                                       f"no longer watching it.")
             except queue.Empty:
                 pass
+
+                # Retry links that would not resolve, so a Roblox API hiccup
+                # (CSRF refresh, rate limit) delays the launch instead of
+            # dropping the account into a public server.
+            for uid in list(self._pending):
+                st = self._pending.get(uid)
+                if st is None or uid not in rt:
+                    self._pending.pop(uid, None)
+                    continue
+                if now >= st.get("next_join_try", 0.0):
+                    self._pending.pop(uid, None)
+                    self._retry_join(st["acc"], st, now)
 
             # Process user-requested relaunches for individual accounts.
             try:
@@ -589,12 +930,12 @@ class MonitorEngine(QThread):
                         _tail = ("rejoining." if relaunch
                                  else "auto-relaunch is off.")
                         self.log.emit(f"Manual restart: {st['acc']['username']} "
-                                      f"— killed manually; {_tail}")
+                                      f"- killed manually; {_tail}")
                         self._notify(
-                            "warn", st['acc'].get("username", "?"),
+                            "warn", st['acc'].get('username', '?'),
                             event="Manual restart",
                             details=self._account_details(st) + [
-                                ("Action", "killed manually — rejoining"
+                                ("Action", "killed manually - rejoining"
                                  if relaunch else "killed manually")],
                             footer="Requested from the app")
                     st["intentional"] = True
@@ -620,7 +961,7 @@ class MonitorEngine(QThread):
                         self.log.emit(f"{st['acc']['username']} is in "
                                       f"(pid {pid}).")
                         self._notify(
-                            "good", st['acc'].get("username", "?"),
+                            "good", st['acc'].get('username', '?'),
                             event="Client launched",
                             details=self._account_details(st),
                             footer="Waiting for Roblox presence")
@@ -631,7 +972,7 @@ class MonitorEngine(QThread):
 
             kick_detect = bool(self.flags.get("kick_detect")) and relaunch
 
-            # One window-enumeration pass per tick covers kick dialogs and
+                # One window-enumeration pass per tick covers kick dialogs and
             # frozen windows for every running client at once.
             running_pids = {s["pid"] for s in rt.values()
                             if s["state"] == "running" and s.get("pid")}
@@ -653,15 +994,20 @@ class MonitorEngine(QThread):
                         st["state"] = "waiting"
                         st["rejoin_at"] = now + int(
                             st.pop("leave_then_delay", acc.get("rdelay", 0) or 0))
-                        self.log.emit(f"{acc['username']} left the game — "
+                        self.log.emit(f"{acc['username']} left the game - "
                                       f"rejoining in "
                                       f"{int(st['rejoin_at'] - now)}s.")
 
                 elif st["state"] == "waiting" and now >= st["rejoin_at"]:
+                    if uid in self._pending:
+                            # Still waiting on the join link: the retry loop above
+                            # owns this account, and it must never relaunch into
+                        # its own game as a fallback.
+                        continue
                     st["state"] = "launching"
                     st["pid"] = None
                     st["open_since"] = None
-                    self.log.emit(f"{acc['username']} — relaunching…")
+                    self.log.emit(f"{acc['username']} - relaunching...")
                     self._enqueue(uid, acc)
 
             # Move accounts apart when Roblox places them in the same server.
@@ -681,13 +1027,13 @@ class MonitorEngine(QThread):
         for s in self._rt_counts_cache.values():
             acc = s["acc"]
             state = s["state"]
-            detail = (f"in game \u00b7 up "
+            detail = (f"in game - up "
                       f"{int(_now - s['open_since']) // 60}m"
                       if state == "running" and s.get("open_since")
                       else state)
             dis = int(s.get("disconnects", 0) or 0)
             if dis:
-                detail += f" \u00b7 {dis} disconnect" + ("s" if dis != 1 else "")
+                detail += f" - {dis} disconnect" + ("s" if dis != 1 else "")
             _entries.append((acc.get("username", "?"), detail))
         self._notify("muted", "Monitoring stopped",
                      details=[("Session",
@@ -703,24 +1049,24 @@ class MonitorEngine(QThread):
     def _handle_launch_failure(self, st: dict, err, now: float,
                                relaunch: bool) -> bool:
         """Classify a failed launch. Returns True when the account was STOPPED
-        (cookie dead — relaunching cannot succeed, needs user action)."""
+        (cookie dead - relaunching cannot succeed, needs user action)."""
         acc = st["acc"]
         errstr = str(err or "")
         if errstr.startswith("auth failed"):
             st["auth_fails"] = st.get("auth_fails", 0) + 1
             if relaunch and st["auth_fails"] >= AUTH_FAIL_LIMIT:
                 # The cookie is dead: retrying would loop forever.
-                reason = "cookie expired or invalid — re-add this account"
+                reason = "cookie expired or invalid - re-add this account"
                 st["state"] = "stopped"
                 self._set_reason(st, reason)
-                self.log.emit(f"Auth: {acc['username']} — {st['auth_fails']} "
+                self.log.emit(f"Auth: {acc['username']} - {st['auth_fails']} "
                               f"failed logins in a row; stopping auto-rejoin.")
                 self._notify(
                     "bad", acc.get("username", "?"),
                     event="Account needs attention",
                     details=[("Reason", reason),
                              ("Failed logins", st["auth_fails"])],
-                    footer="Auto-rejoin stopped — update the cookie")
+                    footer="Auto-rejoin stopped - update the cookie")
                 return True
         else:
             st["auth_fails"] = 0
@@ -735,10 +1081,10 @@ class MonitorEngine(QThread):
 
     # ------------------------------------------------------------------
     # Per-tick health checks for a RUNNING account. Ordered by confidence:
-    #   1. process gone                    → crash
-    #   2. kick/disconnect dialog open     → real reason + error code
-    #   3. window hung                     → frozen client
-    #   4. presence checks                 → kick/disconnect/wrong game/server
+    #   1. process gone                    -> crash
+    #   2. kick/disconnect dialog open     -> real reason + error code
+    #   3. window hung                     -> frozen client
+    #   4. presence checks                 -> kick/disconnect/wrong game/server
     # `client` is this pid's entry from scan_client_states (dialog + hung).
     # ------------------------------------------------------------------
     def _watch_running(self, uid: int, st: dict, pids: set, client: dict,
@@ -752,7 +1098,7 @@ class MonitorEngine(QThread):
                 st["crashes"] += 1
                 st["disconnects"] += 1
                 reason = "client crashed / closed unexpectedly"
-                # No dialog was seen — ask the client's log why it died.
+                # No dialog was seen - ask the client's log why it died.
                 try:
                     hint = latest_client_error()
                 except Exception:
@@ -761,7 +1107,7 @@ class MonitorEngine(QThread):
                     reason += f" (log: {hint})"
                 self._set_reason(st, reason)
                 if relaunch:
-                    self.log.emit(f"Crash: {acc['username']} — {reason} after "
+                    self.log.emit(f"Crash: {acc['username']} - {reason} after "
                                   f"{int(up // 60)}m {int(up % 60)}s in game; "
                                   f"rejoining (crash #{st['crashes']}).")
                     self._notify(
@@ -790,7 +1136,7 @@ class MonitorEngine(QThread):
                 st["state"] = "stopped"
             return
 
-        # 2. A native kick/disconnect/error dialog is open on the client —
+        # 2. A native kick/disconnect/error dialog is open on the client -
         #    this is the definitive removal signal, with the real reason.
         dialog = client.get("dialog")
         if dialog:
@@ -803,7 +1149,7 @@ class MonitorEngine(QThread):
                     # Launch-only mode: report it, leave the dialog for the user.
                     st["dialog_reported"] = True
                     st["disconnects"] += 1
-                    self.log.emit(f"Kick: {acc['username']} — {dialog} "
+                    self.log.emit(f"Kick: {acc['username']} - {dialog} "
                                   f"(auto-relaunch off).")
                     self._notify("warn", acc.get("username", "?"),
                                  event="Kicked from the game",
@@ -813,7 +1159,7 @@ class MonitorEngine(QThread):
                 return
             if error_codes.is_stop_category(category):
                 # Rejoining can never fix this (no permission, platform or
-                # country locked) — stop the account with a clear reason.
+                # country locked) - stop the account with a clear reason.
                 if st.get("pid"):
                     kill_pid(st["pid"])
                 st["disconnects"] += 1
@@ -821,21 +1167,21 @@ class MonitorEngine(QThread):
                 st["pid"] = None
                 st["open_since"] = None
                 st["state"] = "stopped"
-                self.log.emit(f"Needs attention: {acc['username']} — "
+                self.log.emit(f"Needs attention: {acc['username']} - "
                               f"{dialog}; auto-rejoin stopped.")
                 self._notify("bad", acc.get("username", "?"),
                              event="Account needs attention",
                              details=self._account_details(st) + [
                                  ("Reason", dialog)],
-                             footer="Auto-rejoin stopped — fix the cause, "
+                             footer="Auto-rejoin stopped - fix the cause, "
                              "then re-tick the account")
                 return
             if category == error_codes.CATEGORY_RETRY:
                 # The game can't accept joins right now (updating, shut down,
-                # full) — back off longer instead of hammering it.
+                # full) - back off longer instead of hammering it.
                 delay = max(LONG_BACKOFF, int(acc.get("rdelay", 0) or 0))
                 self._remove_from_game(st, now, dialog, delay=delay)
-                self.log.emit(f"Game unavailable: {acc['username']} — "
+                self.log.emit(f"Game unavailable: {acc['username']} - "
                               f"{dialog}; rejoining in {int(delay)}s.")
                 self._notify("warn", acc.get("username", "?"),
                              event="Game temporarily unavailable",
@@ -847,7 +1193,7 @@ class MonitorEngine(QThread):
             # kick / disconnect / session overlap: rejoin (session overlap
             # additionally waits for presence to clear the old session).
             self._remove_from_game(st, now, dialog)
-            self.log.emit(f"Kick: {acc['username']} — {dialog}; "
+            self.log.emit(f"Kick: {acc['username']} - {dialog}; "
                           f"rejoining once it leaves.")
             self._notify("warn", acc.get("username", "?"),
                          event="Kicked from the game",
@@ -865,7 +1211,7 @@ class MonitorEngine(QThread):
                 reason = "client froze (not responding)"
                 if relaunch:
                     self._remove_from_game(st, now, reason)
-                    self.log.emit(f"Frozen: {acc['username']} — {reason}; "
+                    self.log.emit(f"Frozen: {acc['username']} - {reason}; "
                                   f"rejoining.")
                     self._notify("bad", acc.get("username", "?"),
                                  event="Client froze",
@@ -876,7 +1222,7 @@ class MonitorEngine(QThread):
                     st["hung_reported"] = True
                     st["disconnects"] += 1
                     self._set_reason(st, reason)
-                    self.log.emit(f"Frozen: {acc['username']} — {reason} "
+                    self.log.emit(f"Frozen: {acc['username']} - {reason} "
                                   f"(auto-relaunch off).")
                     self._notify("bad", acc.get("username", "?"),
                                  event="Client froze",
@@ -903,7 +1249,7 @@ class MonitorEngine(QThread):
 
         reason = None
         if pstate == "unknown":
-            # Repeated failures ≈ connection loss (or a dead cookie); require
+            # Repeated failures about connection loss (or a dead cookie); require
             # both a streak and elapsed time so rate limits never trigger it.
             st["pres_fails"] += 1
             if st.get("pres_fail_since") is None:
@@ -911,7 +1257,7 @@ class MonitorEngine(QThread):
             if (st["pres_fails"] >= PRESENCE_FAIL_LIMIT
                     and now - st["pres_fail_since"] >= PRESENCE_FAIL_TIME):
                 if st.get("was_ingame"):
-                    reason = "presence unreachable — connection lost"
+                    reason = "presence unreachable - connection lost"
                 elif up >= STUCK_CONNECT_GRACE:
                     reason = "never connected (stuck on the loading screen)"
         else:
@@ -921,23 +1267,35 @@ class MonitorEngine(QThread):
         if reason is None and pstate == "ingame":
             if not self._matches_experience(acc, places, root_place):
                 reason = "in a different game than configured"
-            elif (self._join_instance and st.get("was_ingame")
-                  and gid and gid != self._join_instance
-                  and not self.flags.get("diff_server")):
-                # Landed in open matchmaking instead of the requested server.
-                if st.get("wrong_server_since") is None:
-                    st["wrong_server_since"] = now
-                elif (now - st["wrong_server_since"] >= JOIN_VERIFY_GRACE
-                      and st.get("wrong_server_tries", 0) < JOIN_VERIFY_MAX):
-                    st["wrong_server_tries"] = \
-                        st.get("wrong_server_tries", 0) + 1
-                    reason = ("landed in a different server than requested "
-                              f"(try {st['wrong_server_tries']}/"
-                              f"{JOIN_VERIFY_MAX})")
             else:
+                key = str(acc.get("rjoin") or "").strip()
+                target = self._targets.get(uid, {}).get("target")
+                in_place = self._in_target_place(acc, target, places,
+                                                 root_place)
+                # Only servers in the place the link points at are compared:
+                # a game that moves players between its own places, or into a
+                # reserved server for them, legitimately changes the job id,
+                # and that must never look like a public server.
+                if gid and key and in_place:
+                    self._note_server(key, uid, gid, now)
+                if (target is not None and target.specific and gid and in_place
+                        and not st.get("server_verified")
+                        and not self.flags.get("diff_server")):
+                    ref, backers = self._server_reference(key)
+                    if not ref or gid == ref:
+                        st["server_verified"] = True
+                        st["wrong_server_since"] = None
+                    else:
+                        moved = self._server_moved(acc, target, key, gid, ref,
+                                                   backers, now)
+                        if moved:
+                            st["server_verified"] = True
+                            st["wrong_server_since"] = None
+                        else:
+                            st["server_verified"] = self._wrong_server_tick(
+                                acc, st, target, now)
                 st["was_ingame"] = True
                 st["kick_since"] = None
-                st["wrong_server_since"] = None
         elif reason is None and pstate == "out":
             if st.get("was_ingame"):
                 reason = "kicked/disconnected (client open, not in-game)"
@@ -978,7 +1336,7 @@ class MonitorEngine(QThread):
             event = "Wrong server"
         else:
             event = "Removed from the game"
-        self.log.emit(f"{event}: {acc['username']} — {reason}; "
+        self.log.emit(f"{event}: {acc['username']} - {reason}; "
                       f"rejoining once it leaves.")
         self._notify(
             "warn", acc.get("username", "?"),

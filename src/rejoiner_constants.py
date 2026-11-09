@@ -16,7 +16,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 APP_NAME = "Roblox Rejoin"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 GITHUB_REPO = "imagesent/Roblox-Rejoin"
 RELEASE_ASSET = "Roblox Rejoiner.exe"
 UPDATE_CHECK_SECS = 6 * 3600   # automatic update check cadence
@@ -49,6 +49,10 @@ STUCK_CONNECT_GRACE = 900.0
 # requested server before declaring a mismatch; a couple of checks must agree.
 JOIN_VERIFY_GRACE = 12.0   # settle time after connecting before verifying
 JOIN_VERIFY_MAX = 3        # wrong-server relaunch attempts per account
+# A private server gets a new job id when Roblox restarts it, and games move
+# players between servers of their own accord, so a mismatch asks the link
+# again rather than immediately closing the client - at most this often.
+SERVER_REPROBE_SECS = 60.0
 # An expired/invalid cookie can never launch a client. After this many
 # consecutive auth failures, stop auto-rejoining that account and say why.
 AUTH_FAIL_LIMIT = 5
@@ -61,6 +65,22 @@ DEFAULT_SERVER_CAP = 50    # assumed max players when the API omits capacity
 AUTH_TICKET_URL = "https://auth.roblox.com/v1/authentication-ticket/"
 USERS_AUTH_URL = "https://users.roblox.com/v1/users/authenticated"
 SHARE_RESOLVE_URL = "https://apis.roblox.com/sharelinks/v1/resolve-link"
+PLACE_LAUNCHER_URL = "https://assetgame.roblox.com/game/PlaceLauncher.ashx"
+PRIVATE_SERVERS_API = "https://games.roblox.com"
+VIP_SERVERS_API = "https://games.roblox.com"
+# Resolving a share link can fail transiently (CSRF, rate limit, blip) — the
+# engine retries this many times before giving up on the link for good.
+JOIN_RESOLVE_ATTEMPTS = 3
+JOIN_RESOLVE_WAIT = 4.0          # seconds between share-link resolve attempts
+# Private-server browser: one server lookup per page, capped so a big
+# collection can never stall the dialog.
+JOIN_PRIVATE_PAGES = 3
+JOIN_PRIVATE_PAGE_SIZE = 10
+# A join link that will not resolve is retried on this cadence, and given up
+# on after this many attempts (the account is stopped with the reason shown
+# instead of being dropped into public matchmaking behind the user's back).
+JOIN_RETRY_SECS = 30.0
+JOIN_RESOLVE_GIVEUP = 5
 UA = "Roblox/WinInet"
 DISCORD_HOSTS = ("discord.com", "discordapp.com", "canary.discord.com",
                  "ptb.discord.com")

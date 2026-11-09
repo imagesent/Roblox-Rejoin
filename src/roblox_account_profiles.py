@@ -30,7 +30,8 @@ def _open(req, timeout=12):
 class ProfileFetcher(QObject):
     """Background, batched fetch of (display_name, avatar_path) per user id."""
 
-    fetched = Signal(int, str, str)        # uid, display_name, avatar_path ("" if none)
+    # Roblox user IDs are 64-bit, so they cannot ride an int signal.
+    fetched = Signal(object, str, str)     # uid, display_name, avatar_path ("" if none)
 
     def fetch(self, uid: int):
         self.fetch_batch([int(uid)])
